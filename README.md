@@ -2,7 +2,7 @@
 
 Claude Code project hook that **blocks Salesforce deployments to production orgs**. No exceptions.
 
-When this hook is active, Claude Code cannot run `sf project deploy`, `sf deploy`, or any legacy `sfdx force:source:deploy` / `force:mdapi:deploy` / `force:source:push` command against an org that is not a sandbox or scratch org. The hook fails closed: if the target org cannot be resolved, the deploy is denied.
+When this hook is active, Claude Code cannot run `sf project deploy`, `sf deploy`, or any legacy `sfdx force:source:deploy` / `force:mdapi:deploy` / `force:source:push` command against a real production org. Sandboxes, scratch orgs, Developer Edition orgs (including chartBuddy and other Dev Hubs), and trial / pre-release / signup orgs are allowed. The hook fails closed: if the target org cannot be resolved, the deploy is denied.
 
 ---
 
@@ -29,11 +29,13 @@ Claude Code supports `PreToolUse` hooks that run before a tool is executed. A ho
 2. Returns `exit 0` immediately if the command is not a deploy.
 3. Skips commands wrapped in `echo`, `printf`, or `cat` (documentation, not execution).
 4. Parses `--target-org` / `--targetusername` / `-o` / `-u` from the command. Falls back to the default target org if unset.
-5. Runs `sf org display --target-org <alias> --json` to resolve the org.
-6. Reads `result.isSandbox` and `result.isScratch` from the response.
-7. **Denies** the tool call if `isSandbox=false` AND `isScratch=false`.
-8. **Denies** the tool call if `sf org display` cannot resolve the org at all.
-9. Otherwise allows it.
+5. Runs `sf org display --target-org <alias> --json` to resolve the org. **Denies** if it cannot.
+6. Allows immediately if `isSandbox=true` or `isScratch=true`.
+7. Allows immediately if the `instanceUrl` matches a reserved Salesforce subdomain pattern: `*.sandbox.my.salesforce.com`, `*.develop.my.salesforce.com`, `*.scratch.my.salesforce.com`, `*.pre.my.salesforce.com`, or `*prerellogin.pre.salesforce.com*`.
+8. Otherwise queries `Organization` for `OrganizationType` and `TrialExpirationDate`.
+9. Allows if `OrganizationType` is `Developer Edition`, `Partner Developer Edition`, or `Personal Edition`.
+10. Allows if `TrialExpirationDate` is set (trial / pre-release / signup orgs).
+11. **Denies** everything else (real Enterprise/Unlimited/Performance/Group/Professional/Base orgs with no trial).
 
 Denials are emitted as:
 
@@ -61,12 +63,20 @@ These patterns are matched even when the deploy command is chained behind `cd ..
 
 ### Decision rule
 
-| `isSandbox` | `isScratch` | Decision |
-|-------------|-------------|----------|
-| `true`      | any         | allow    |
-| any         | `true`      | allow    |
-| `false`     | `false`     | **deny** |
-| unknown     | unknown     | **deny** (fail closed) |
+Checks are evaluated top-to-bottom. The first matching row wins.
+
+| Signal | Decision |
+|---|---|
+| `isSandbox = true` | allow |
+| `isScratch = true` | allow |
+| `instanceUrl` matches `*.sandbox.my.salesforce.com` | allow |
+| `instanceUrl` matches `*.develop.my.salesforce.com` (Developer Edition) | allow |
+| `instanceUrl` matches `*.scratch.my.salesforce.com` | allow |
+| `instanceUrl` matches `*.pre.my.salesforce.com` or `prerellogin.pre.salesforce.com` (pre-release pods) | allow |
+| `OrganizationType` ∈ { Developer Edition, Partner Developer Edition, Personal Edition } | allow |
+| `TrialExpirationDate` is not null (trial / pre-release / signup) | allow |
+| Anything else (real Enterprise / Unlimited / Performance / Group / Professional / Base edition) | **deny** |
+| Org cannot be resolved or queried | **deny** (fail closed) |
 
 ---
 
@@ -176,7 +186,7 @@ ka-vault/
 
 **The hook didn't fire.** Open `/hooks` in Claude Code or restart. The settings watcher only tracks `.claude/` directories that existed at session start.
 
-**It blocks everything, even sandbox deploys.** Confirm `sf` is on the hook shell's `PATH` and `sf org display --target-org <your-alias> --json` succeeds in your terminal. If `sf org display` returns `isSandbox: false` for what you believe is a sandbox, your alias is wrong — verify with `sf org list`.
+**It blocks everything, even sandbox deploys.** Confirm `sf` is on the hook shell's `PATH` and `sf org display --target-org <your-alias> --json` succeeds in your terminal. If `sf org display` returns `DomainNotFoundError`, the auth file is stale — re-authenticate with `sf org login web --instance-url <url>` and retry. The hook recognizes sandboxes by URL pattern even when stale auth lies about `isSandbox`, but it cannot recognize anything if the org won't resolve at all.
 
 **It blocked a deploy whose target org I haven't authenticated yet.** That's correct fail-closed behavior. Authenticate the org first with `sf org login web`, then retry.
 

@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # PreToolUse/Bash hook: block any `sf`/`sfdx` deploy targeting a production org.
-# Decision rule: production = isSandbox=false AND isScratch=false.
+#
+# Allowed targets (any one is sufficient):
+#   - Sandbox          (isSandbox=true)
+#   - Scratch org      (isScratch=true)
+#   - Developer / Partner Developer / Personal Edition
+#   - Trial / pre-release / signup orgs (TrialExpirationDate set)
+#   - Instance URLs matching .develop / .scratch / .pre.my.salesforce.com
+# Anything else is treated as production and denied.
+# Fails closed: if the org cannot be resolved, the deploy is denied.
 # Exits 0 always; emits PreToolUse permissionDecision JSON to deny.
 
 set -uo pipefail
@@ -70,9 +78,50 @@ INSTANCE_URL="$(printf '%s' "$ORG_JSON" | jq -r '.result.instanceUrl // ""')"
 USERNAME="$(printf '%s' "$ORG_JSON" | jq -r '.result.username // ""')"
 ALIAS="$(printf '%s' "$ORG_JSON" | jq -r '.result.alias // ""')"
 
-# Production = neither sandbox nor scratch.
-if [ "$IS_SANDBOX" != "true" ] && [ "$IS_SCRATCH" != "true" ]; then
-  emit_block "BLOCKED: deployment to a PRODUCTION org is forbidden. target='${TARGET_ORG:-<default>}' alias='${ALIAS}' username='${USERNAME}' instanceUrl='${INSTANCE_URL}' isSandbox=${IS_SANDBOX} isScratch=${IS_SCRATCH}. Production deployments must run from a CI pipeline or out-of-band, never from Claude Code. NO EXCEPTIONS."
+# --- Fast-path allows (no SOQL needed) ---
+
+# Sandbox or scratch.
+if [ "$IS_SANDBOX" = "true" ] || [ "$IS_SCRATCH" = "true" ]; then
+  exit 0
 fi
 
-exit 0
+# URL pattern allows: Sandbox / Developer Edition / scratch / pre-release pods.
+# These subdomains are reserved by Salesforce and authoritative even when sf's
+# cached auth data lies about isSandbox.
+case "$INSTANCE_URL" in
+  *.sandbox.my.salesforce.com|*.sandbox.my.salesforce.com/*) exit 0 ;;
+  *.develop.my.salesforce.com|*.develop.my.salesforce.com/*) exit 0 ;;
+  *.scratch.my.salesforce.com|*.scratch.my.salesforce.com/*) exit 0 ;;
+  *.pre.my.salesforce.com|*.pre.my.salesforce.com/*)         exit 0 ;;
+  *prerellogin.pre.salesforce.com*)                          exit 0 ;;
+esac
+
+# --- Authoritative SOQL check ---
+# Query Organization for OrganizationType + TrialExpirationDate.
+# Allow Developer Edition variants and any org with a trial expiration date.
+ORG_SOQL_ARGS=("data" "query" "--query" "SELECT IsSandbox, OrganizationType, TrialExpirationDate FROM Organization" "--json")
+if [ -n "$TARGET_ORG" ]; then
+  ORG_SOQL_ARGS+=("--target-org" "$TARGET_ORG")
+fi
+
+ORG_SOQL_JSON="$("$SF_BIN" "${ORG_SOQL_ARGS[@]}" 2>/dev/null)"
+
+if [ -z "$ORG_SOQL_JSON" ] || ! printf '%s' "$ORG_SOQL_JSON" | jq -e '.result.records[0]' >/dev/null 2>&1; then
+  emit_block "BLOCKED: Could not query Organization on target='${TARGET_ORG:-<default>}' (alias='${ALIAS}', instanceUrl='${INSTANCE_URL}'). Cannot confirm this is a Developer Edition, sandbox, scratch, or trial org. Production deploys are forbidden — verify auth and retry."
+fi
+
+ORG_TYPE="$(printf '%s' "$ORG_SOQL_JSON" | jq -r '.result.records[0].OrganizationType // ""')"
+TRIAL_EXP="$(printf '%s' "$ORG_SOQL_JSON" | jq -r '.result.records[0].TrialExpirationDate // ""')"
+
+# Developer Edition family.
+case "$ORG_TYPE" in
+  "Developer Edition"|"Partner Developer Edition"|"Personal Edition") exit 0 ;;
+esac
+
+# Trial / pre-release / signup orgs always have TrialExpirationDate set.
+if [ -n "$TRIAL_EXP" ] && [ "$TRIAL_EXP" != "null" ]; then
+  exit 0
+fi
+
+# Otherwise: real production edition (Enterprise / Unlimited / Performance / Group / Professional / Base / etc.) with no trial.
+emit_block "BLOCKED: deployment to a PRODUCTION org is forbidden. target='${TARGET_ORG:-<default>}' alias='${ALIAS}' username='${USERNAME}' instanceUrl='${INSTANCE_URL}' OrganizationType='${ORG_TYPE}' isSandbox=${IS_SANDBOX} isScratch=${IS_SCRATCH} TrialExpirationDate='${TRIAL_EXP}'. Production deployments must run from a CI pipeline or out-of-band, never from Claude Code. NO EXCEPTIONS."
