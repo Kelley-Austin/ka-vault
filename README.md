@@ -18,9 +18,13 @@ Claude Code supports `PreToolUse` hooks that run before a tool is executed. A ho
 
 ```
 .claude/
-├── settings.json                   # registers the hook
+├── settings.json                   # registers the hook (project-level)
 └── hooks/
     └── block-sf-prod-deploy.sh     # the guard script
+admin/
+├── setup.sh                        # activate admin override
+└── disable.sh                      # deactivate admin override
+install.sh                          # install hook globally (all projects)
 ```
 
 `.claude/settings.json` registers a `PreToolUse` matcher on `Bash`. Every Bash command Claude Code attempts is piped to the script as JSON on stdin. The script:
@@ -28,14 +32,15 @@ Claude Code supports `PreToolUse` hooks that run before a tool is executed. A ho
 1. Reads `tool_input.command` from the JSON payload.
 2. Returns `exit 0` immediately if the command is not a deploy.
 3. Skips commands wrapped in `echo`, `printf`, or `cat` (documentation, not execution).
-4. Parses `--target-org` / `--targetusername` / `-o` / `-u` from the command. Falls back to the default target org if unset.
-5. Runs `sf org display --target-org <alias> --json` to resolve the org. **Denies** if it cannot.
-6. Allows immediately if `isSandbox=true` or `isScratch=true`.
-7. Allows immediately if the `instanceUrl` matches a reserved Salesforce subdomain pattern: `*.sandbox.my.salesforce.com`, `*.develop.my.salesforce.com`, `*.scratch.my.salesforce.com`, `*.pre.my.salesforce.com`, or `*prerellogin.pre.salesforce.com*`.
-8. Otherwise queries `Organization` for `OrganizationType` and `TrialExpirationDate`.
-9. Allows if `OrganizationType` is `Developer Edition`, `Partner Developer Edition`, or `Personal Edition`.
-10. Allows if `TrialExpirationDate` is set (trial / pre-release / signup orgs).
-11. **Denies** everything else (real Enterprise/Unlimited/Performance/Group/Professional/Base orgs with no trial).
+4. Checks the **admin override** — if the current user is an active member of `Kelley-Austin/prod-deploy-admins` and has a valid local override file, the deploy is allowed.
+5. Parses `--target-org` / `--targetusername` / `-o` / `-u` from the command. Falls back to the default target org if unset.
+6. Runs `sf org display --target-org <alias> --json` to resolve the org. **Denies** if it cannot.
+7. Allows immediately if `isSandbox=true` or `isScratch=true`.
+8. Allows immediately if the `instanceUrl` matches a reserved Salesforce subdomain pattern: `*.sandbox.my.salesforce.com`, `*.develop.my.salesforce.com`, `*.scratch.my.salesforce.com`, `*.pre.my.salesforce.com`, or `*prerellogin.pre.salesforce.com*`.
+9. Otherwise queries `Organization` for `OrganizationType` and `TrialExpirationDate`.
+10. Allows if `OrganizationType` is `Developer Edition`, `Partner Developer Edition`, or `Personal Edition`.
+11. Allows if `TrialExpirationDate` is set (trial / pre-release / signup orgs).
+12. **Denies** everything else (real Enterprise/Unlimited/Performance/Group/Professional/Base orgs with no trial).
 
 Denials are emitted as:
 
@@ -67,6 +72,7 @@ Checks are evaluated top-to-bottom. The first matching row wins.
 
 | Signal | Decision |
 |---|---|
+| User is active member of `Kelley-Austin/prod-deploy-admins` + local override file valid | **allow** (admin override) |
 | `isSandbox = true` | allow |
 | `isScratch = true` | allow |
 | `instanceUrl` matches `*.sandbox.my.salesforce.com` | allow |
@@ -82,13 +88,19 @@ Checks are evaluated top-to-bottom. The first matching row wins.
 
 ## Installation
 
-Clone or copy this repo onto your workstation:
+### For all employees (required)
+
+Clone the repo and run the install script once per machine:
 
 ```bash
-git clone https://github.com/Kelley-Austin/ka-vault.git
+git clone https://github.com/Kelley-Austin/ka-vault.git ~/Documents/Perficient\ Projects/ka-vault
+cd ~/Documents/Perficient\ Projects/ka-vault
+bash install.sh
 ```
 
-The hook activates automatically when Claude Code is launched with this directory as the project root, because Claude Code reads `.claude/settings.json` on session start.
+`install.sh` copies the hook script to `~/.config/ka-vault/hooks/` and registers it in `~/.claude/settings.json`. This makes the guard active for **every Claude Code session** on this machine, not just sessions started in the `ka-vault` directory. Restart any open Claude Code sessions afterward.
+
+> **This is mandatory.** Every developer must run `install.sh` before using Claude Code on any Salesforce project.
 
 ### Requirements
 
@@ -102,12 +114,43 @@ The hook activates automatically when Claude Code is launched with this director
 
 ### Activating the hook in an existing session
 
-Claude Code's settings watcher only picks up `.claude/` directories that existed when the session started. If you added this repo mid-session:
+Claude Code's settings watcher only picks up new `.claude/` entries when the session starts. If you installed mid-session:
 
-- Open `/hooks` once (reloads config), **or**
 - Restart Claude Code.
 
-New sessions started inside this directory pick the hook up automatically.
+New sessions pick the hook up automatically after `install.sh` has been run.
+
+---
+
+## Admin override
+
+Active members of the `Kelley-Austin/prod-deploy-admins` GitHub team can temporarily disable the guard on their own machine. The override is local, scoped to 24 hours, and automatically re-verified against GitHub at expiry.
+
+### Activating the override
+
+```bash
+bash ~/Documents/Perficient\ Projects/ka-vault/admin/setup.sh
+```
+
+This verifies your GitHub team membership via `gh` and writes a timestamped override file to `~/.local/share/ka-vault/admin-override`. The next Claude Code deploy check reads the file, confirms the timestamp is under 24 hours old, and allows the deploy.
+
+After 24 hours, the hook re-queries GitHub. If you are still in the team, it renews automatically. If you have been removed from the team, the override is revoked.
+
+### Deactivating the override
+
+```bash
+bash ~/Documents/Perficient\ Projects/ka-vault/admin/disable.sh
+```
+
+Removes the override file immediately. The guard resumes for the next deploy attempt.
+
+### Adding / removing admins
+
+Admin access is controlled entirely through GitHub team membership — no code changes needed.
+
+- **Grant access:** Add the user to `Kelley-Austin/prod-deploy-admins` on GitHub.
+- **Revoke access:** Remove them from the team. Their override file will expire within 24 hours and fail re-verification.
+- **Immediate revocation:** Remove from team + ask them to run `admin/disable.sh`. Their next deploy attempt will also detect the removal and revoke the local file.
 
 ---
 
@@ -162,13 +205,19 @@ The script always exits `0` — denial is communicated via the JSON body, per th
 ```
 ka-vault/
 ├── .claude/
-│   ├── settings.json                # registers the PreToolUse Bash hook
+│   ├── settings.json                # registers the PreToolUse Bash hook (project-level)
 │   └── hooks/
 │       └── block-sf-prod-deploy.sh  # guard script (fail-closed)
+├── admin/
+│   ├── setup.sh                     # activate admin override (team members only)
+│   └── disable.sh                   # deactivate admin override
+├── install.sh                       # install hook globally into ~/.claude/settings.json
 └── README.md
 ```
 
 `.claude/settings.json` is checked in so every contributor working in this repo gets the protection automatically. There is no `.claude/settings.local.json`; this guard is intentionally not user-overridable at the project level.
+
+The globally-installed copy (written by `install.sh`) lives at `~/.local/share/ka-vault/hooks/block-sf-prod-deploy.sh` and is registered in `~/.claude/settings.json`. It is functionally identical to the project-level copy.
 
 ---
 
@@ -178,16 +227,20 @@ ka-vault/
 - **Target resolution.** The script honors explicit `--target-org` first, then falls back to whatever `sf` considers the current default — same resolution order as the deploy command itself, so the org being checked is the org that would be deployed to.
 - **No wrapper bypass.** Wrapping a deploy in a subshell, `cd && ...`, or a `VAR=foo sf ...` prefix does not evade the matcher. Hiding it inside `echo`, `printf`, or `cat` is not bypass either — those commands don't execute the deploy, so they're allowed.
 - **Decoupled from validate vs. start.** All `sf project deploy` subcommands are gated, including `validate` and `quick`. `validate` against production consumes a deployment slot, and `quick` will actually deploy a previously-validated package. Both are blocked when the target is production.
-- **No exceptions.** The hook does not honor an env-var override, a magic flag, or a comment marker. If you need to deploy to production, do it from CI or an out-of-band terminal session, not from Claude Code.
+- **Admin override is GitHub-authoritative.** The bypass check is verified against the GitHub API, not a local secret. Removing someone from the `prod-deploy-admins` team on GitHub is the single revocation action; no hook code needs to change.
+- **Admin override is machine-local.** The override file at `~/.local/share/ka-vault/admin-override` does not exist in the repo and has no effect on other users' machines.
+- **No exceptions for non-admins.** The hook does not honor an env-var override, a magic flag, or a comment marker for regular users. If a non-admin needs to deploy to production, they must do it from a standard terminal outside Claude Code.
 
 ---
 
 ## Troubleshooting
 
-**The hook didn't fire.** Open `/hooks` in Claude Code or restart. The settings watcher only tracks `.claude/` directories that existed at session start.
+**The hook didn't fire.** Restart Claude Code — it reads `~/.claude/settings.json` at session start. If the global settings were updated while the session was already open, the hook won't load until restart.
 
 **It blocks everything, even sandbox deploys.** Confirm `sf` is on the hook shell's `PATH` and `sf org display --target-org <your-alias> --json` succeeds in your terminal. If `sf org display` returns `DomainNotFoundError`, the auth file is stale — re-authenticate with `sf org login web --instance-url <url>` and retry. The hook recognizes sandboxes by URL pattern even when stale auth lies about `isSandbox`, but it cannot recognize anything if the org won't resolve at all.
 
 **It blocked a deploy whose target org I haven't authenticated yet.** That's correct fail-closed behavior. Authenticate the org first with `sf org login web`, then retry.
 
-**I want it disabled.** Don't disable it. If you're certain you need to bypass it for a legitimate reason, run the deploy from a shell outside Claude Code.
+**Admin override isn't working.** Confirm `gh auth status` succeeds and that you are an active (not pending) member of `Kelley-Austin/prod-deploy-admins`. Run `admin/setup.sh` again to refresh the cache.
+
+**I want it disabled (non-admin).** Don't disable it. If you need to deploy to production, use a standard terminal session outside Claude Code.

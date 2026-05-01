@@ -50,6 +50,40 @@ emit_block() {
   exit 0
 }
 
+# ── Admin override (GitHub team membership) ───────────────────────────────────
+# Active members of Kelley-Austin/prod-deploy-admins may disable this guard.
+# To activate: run admin/setup.sh in the ka-vault repo.
+# Membership is verified via the GitHub CLI and cached locally for 24 hours.
+# The hook fails closed if gh is unavailable or not authenticated.
+OVERRIDE_FILE="${HOME}/.local/share/ka-vault/admin-override"
+if [ -f "$OVERRIDE_FILE" ]; then
+  _CACHED="$(cat "$OVERRIDE_FILE" 2>/dev/null || echo "")"
+  _STATE="$(printf '%s' "$_CACHED" | cut -d'|' -f1)"
+  _TS="$(printf '%s' "$_CACHED" | cut -d'|' -f2)"
+  _NOW="$(date +%s)"
+  # Fast path: cache is valid (less than 24 h old)
+  if [ "$_STATE" = "allowed" ] && [ -n "$_TS" ] && [ "$(( _NOW - ${_TS:-0} ))" -lt 86400 ]; then
+    exit 0
+  fi
+  # Cache expired or invalid — re-verify GitHub team membership
+  _GH="$(command -v gh 2>/dev/null || true)"
+  if [ -n "$_GH" ]; then
+    _GH_USER="$("$_GH" api user --jq '.login' 2>/dev/null || echo "")"
+    if [ -n "$_GH_USER" ]; then
+      _MEMBERSHIP="$("$_GH" api \
+        "orgs/Kelley-Austin/teams/prod-deploy-admins/memberships/${_GH_USER}" \
+        --jq '.state' 2>/dev/null || echo "")"
+      if [ "$_MEMBERSHIP" = "active" ]; then
+        mkdir -p "$(dirname "$OVERRIDE_FILE")"
+        printf 'allowed|%s\n' "$_NOW" > "$OVERRIDE_FILE"
+        exit 0
+      fi
+    fi
+  fi
+  # File exists but user is not an active admin — remove stale file, fall through to deny
+  rm -f "$OVERRIDE_FILE"
+fi
+
 # Resolve sf binary (PATH may differ inside hook shell).
 SF_BIN="$(command -v sf || true)"
 if [ -z "$SF_BIN" ]; then
