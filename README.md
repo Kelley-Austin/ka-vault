@@ -98,7 +98,13 @@ cd ~/Documents/Perficient\ Projects/ka-vault
 bash install.sh
 ```
 
-`install.sh` copies the hook script to `~/.config/ka-vault/hooks/` and registers it in `~/.claude/settings.json`. This makes the guard active for **every Claude Code session** on this machine, not just sessions started in the `ka-vault` directory. Restart any open Claude Code sessions afterward.
+`install.sh` does three things:
+
+1. Copies the hook script to `~/.local/share/ka-vault/hooks/` and registers it in `~/.claude/settings.json` so the guard is active for **every Claude Code session** on this machine.
+2. Installs the `cheese-backup-then-modify` helper to `~/.local/bin/` (a separate, non-security utility — see `bin/cheese-backup-then-modify -h`).
+3. Idempotently adds `"Bash(git *)"` to the `permissions.allow` array in `~/.claude/settings.json` so `git checkout`, `git merge`, `git status`, etc. don't trigger permission prompts in any Claude Code session. **This is independent of the prod-deploy block** — the hook intercepts `sf project deploy start|validate|quick|resume` regardless of what's in the allow list.
+
+Restart any open Claude Code sessions afterward to pick up the changes.
 
 > **This is mandatory.** Every developer must run `install.sh` before using Claude Code on any Salesforce project.
 
