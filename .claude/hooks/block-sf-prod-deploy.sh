@@ -18,9 +18,14 @@ CMD="$(printf '%s' "$INPUT" | jq -r '.tool_input.command // ""')"
 
 [ -z "$CMD" ] && exit 0
 
-# Match deploy subcommands of sf or sfdx, regardless of leading wrappers (cd && ..., env VAR=..., etc.).
-# Covered: sf project deploy [start|validate|quick|...], sf deploy, legacy sfdx force:source:deploy / force:mdapi:deploy / force:source:push.
-if ! printf '%s' "$CMD" | grep -qiE '(^|[[:space:]]|;|&&|\|\||`|\()(sf|sfdx)[[:space:]]+(project[[:space:]]+deploy|deploy([[:space:]]|$)|force:source:deploy|force:mdapi:deploy|force:source:push)'; then
+# Match deploy-WRITING subcommands only, regardless of leading wrappers (cd && ..., env VAR=..., etc.).
+# Blocked:    sf project deploy [start|validate|quick|resume], sf deploy [same],
+#             legacy sfdx force:source:deploy / force:mdapi:deploy / force:source:push.
+# Allowed:    sf project deploy report   (status check, read-only)
+#             sf project deploy preview  (dry-run, no writes)
+#             sf project deploy cancel   (aborts an in-flight deploy, doesn't write)
+#             sf project retrieve, sf data query, sf org display, etc.
+if ! printf '%s' "$CMD" | grep -qiE '(^|[[:space:]]|;|&&|\|\||`|\()(sf|sfdx)[[:space:]]+(project[[:space:]]+deploy[[:space:]]+(start|validate|quick|resume)([[:space:]]|$)|deploy[[:space:]]+(start|validate|quick|resume)([[:space:]]|$)|force:source:deploy|force:mdapi:deploy|force:source:push)'; then
   exit 0
 fi
 

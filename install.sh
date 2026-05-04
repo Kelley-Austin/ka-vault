@@ -16,8 +16,11 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_HOOK="${REPO_DIR}/.claude/hooks/block-sf-prod-deploy.sh"
+SRC_BACKUP_HELPER="${REPO_DIR}/bin/cheese-backup-then-modify"
 DEST_DIR="${HOME}/.local/share/ka-vault/hooks"
 DEST_HOOK="${DEST_DIR}/block-sf-prod-deploy.sh"
+DEST_BIN_DIR="${HOME}/.local/bin"
+DEST_BACKUP_HELPER="${DEST_BIN_DIR}/cheese-backup-then-modify"
 GLOBAL_SETTINGS="${HOME}/.claude/settings.json"
 
 # ── 1. Verify requirements ────────────────────────────────────────────────────
@@ -38,6 +41,19 @@ mkdir -p "$DEST_DIR"
 cp "$SRC_HOOK" "$DEST_HOOK"
 chmod +x "$DEST_HOOK"
 echo "✓ Hook copied to ${DEST_HOOK}"
+
+# Install cheese-backup-then-modify onto PATH (~/.local/bin)
+if [ -f "$SRC_BACKUP_HELPER" ]; then
+  mkdir -p "$DEST_BIN_DIR"
+  cp "$SRC_BACKUP_HELPER" "$DEST_BACKUP_HELPER"
+  chmod +x "$DEST_BACKUP_HELPER"
+  echo "✓ Backup helper copied to ${DEST_BACKUP_HELPER}"
+  case ":${PATH}:" in
+    *":${DEST_BIN_DIR}:"*) : ;;
+    *) echo "  ⚠️  ${DEST_BIN_DIR} is not on your PATH. Add it to your shell rc:" >&2
+       echo "       export PATH=\"\$HOME/.local/bin:\$PATH\"" >&2 ;;
+  esac
+fi
 
 # ── 3. Register hook in ~/.claude/settings.json ───────────────────────────────
 
