@@ -77,6 +77,18 @@ else
   echo "✓ Hook registered in ${GLOBAL_SETTINGS}"
 fi
 
+# Allowlist Bash(git *) globally so git commands don't hit permission prompts
+# in any Claude Code session — including project-cwd sessions launched by CHEESE.
+# This is independent of the prod-deploy hook above, which still intercepts
+# `sf project deploy start|validate|quick|resume` regardless of allowlist state.
+if jq -e '(.permissions.allow // []) | index("Bash(git *)")' "$GLOBAL_SETTINGS" >/dev/null 2>&1; then
+  echo "✓ Bash(git *) already in ${GLOBAL_SETTINGS} allow list — nothing to do"
+else
+  UPDATED="$(jq '.permissions.allow //= [] | .permissions.allow += ["Bash(git *)"]' "$GLOBAL_SETTINGS")"
+  printf '%s\n' "$UPDATED" > "$GLOBAL_SETTINGS"
+  echo "✓ Bash(git *) added to ${GLOBAL_SETTINGS} allow list"
+fi
+
 # ── 4. Done ───────────────────────────────────────────────────────────────────
 
 echo ""
