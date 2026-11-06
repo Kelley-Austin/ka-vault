@@ -1,96 +1,138 @@
 # ka-vault
 
-Claude Code project hook that **blocks Salesforce deployments to production orgs**. No exceptions.
+A Claude Code hook that **blocks every Salesforce CLI command that can change a production org**. There are no exceptions and no override.
 
-When this hook is active, Claude Code cannot run `sf project deploy`, `sf deploy`, or any legacy `sfdx force:source:deploy` / `force:mdapi:deploy` / `force:source:push` command against a real production org. Sandboxes, scratch orgs, Developer Edition orgs (including chartBuddy and other Dev Hubs), and trial / pre-release / signup orgs are allowed. The hook fails closed: if the target org cannot be resolved, the deploy is denied.
+The guard allows writes to these orgs:
+
+- sandboxes
+- scratch orgs
+- Developer Edition orgs
+- trial orgs
+- demo orgs (IDO, SDO) that are in the allowlist
+
+The guard fails closed. If it cannot prove that the target org is not production, it blocks the command.
 
 ---
 
 ## Why
 
-Production deployments must be deliberate human actions performed from a CI pipeline or an explicitly-supervised terminal session. They must not be triggered by an LLM agent, even an instructed one. This repo enforces that as a hard pre-tool gate, so the protection is mechanical rather than dependent on prompting.
+A person must start every production deployment on purpose, from a CI pipeline or from a terminal outside Claude Code. An AI agent must never start one, even when someone tells it to. This repo enforces that rule mechanically, before the command runs, so the protection does not depend on prompts.
 
 ---
 
 ## How it works
 
-Claude Code supports `PreToolUse` hooks that run before a tool is executed. A hook can return JSON that denies permission to run the tool. This project ships:
+Claude Code runs a `PreToolUse` hook before each Bash command. The hook gets the command as JSON on stdin. It allows the command with exit code `0`, or blocks it with exit code `2`. When it blocks, Claude Code shows the reason (stderr) to the model.
 
 ```
-.claude/
-├── settings.json                   # registers the hook (project-level)
-└── hooks/
-    └── block-sf-prod-deploy.sh     # the guard script
-admin/
-├── setup.sh                        # activate admin override
-└── disable.sh                      # deactivate admin override
-install.sh                          # install hook globally (all projects)
+guard/
+├── block-sf-prod-deploy.sh   # hook entry: finds Node.js, changes every failure into exit 2
+├── sf-prod-guard.mjs         # Node entry point
+├── guard-lib.mjs             # shell parser, command classification, org check
+├── sf-command-table.json     # every sf command and whether it takes --target-org (generated)
+├── gen-sf-command-table.mjs  # makes sf-command-table.json again from the installed CLI
+└── allowed-orgs.json         # Org ID allowlist for demo orgs (IDO/SDO)
+tests/guard.test.mjs          # end-to-end tests with a fake sf (no org access)
+install.sh                    # installs the guard for all Claude Code sessions
 ```
 
-`.claude/settings.json` registers a `PreToolUse` matcher on `Bash`. Every Bash command Claude Code attempts is piped to the script as JSON on stdin. The script:
+### Step 1: Parse the command as shell syntax
 
-1. Reads `tool_input.command` from the JSON payload.
-2. Returns `exit 0` immediately if the command is not a deploy.
-3. Skips commands wrapped in `echo`, `printf`, or `cat` (documentation, not execution).
-4. Checks the **admin override** — if the current user is an active member of `Kelley-Austin/prod-deploy-admins` and has a valid local override file, the deploy is allowed.
-5. Parses `--target-org` / `--targetusername` / `-o` / `-u` from the command. Falls back to the default target org if unset.
-6. Runs `sf org display --target-org <alias> --json` to resolve the org. **Denies** if it cannot.
-7. Allows immediately if `isSandbox=true` or `isScratch=true`.
-8. Allows immediately if the `instanceUrl` matches a reserved Salesforce subdomain pattern: `*.sandbox.my.salesforce.com`, `*.develop.my.salesforce.com`, `*.scratch.my.salesforce.com`, `*.pre.my.salesforce.com`, or `*prerellogin.pre.salesforce.com*`.
-9. Otherwise queries `Organization` for `OrganizationType` and `TrialExpirationDate`.
-10. Allows if `OrganizationType` is `Developer Edition`, `Partner Developer Edition`, or `Personal Edition`.
-11. Allows if `TrialExpirationDate` is set (trial / pre-release / signup orgs).
-12. **Denies** everything else (real Enterprise/Unlimited/Performance/Group/Professional/Base orgs with no trial).
+The guard does not search the command text with a regex. It parses the command the way a shell does:
 
-Denials are emitted as:
+- quotes, `\` escapes, `$'...'`, and line continuations
+- comments
+- heredocs (data), and `$(...)` inside an unquoted heredoc (runs)
+- `$(...)`, backticks, `<(...)`, and subshells
+- `&&`, `||`, `;`, `|`, and new lines
 
-```json
-{
-  "hookSpecificOutput": {
-    "hookEventName": "PreToolUse",
-    "permissionDecision": "deny",
-    "permissionDecisionReason": "BLOCKED: deployment to a PRODUCTION org is forbidden. ..."
-  }
-}
+It then finds each `sf` or `sfdx` call, also behind wrappers: `env`, `sudo`, `time`, `timeout`, `xargs`, `command`, `exec`, `script`, `find -exec`, `npx @salesforce/cli`, `npm exec`, `node .../@salesforce/cli/bin/run.js`, `bash -c`, `sh -c`, `eval`, and `watch`. It also checks the parts of `awk` (`system()`, `getline`, pipes), GNU `sed` (the `e` command), and `git -c` that can run commands. It also finds `sf` when the command name is written as a path (`/opt/homebrew/bin/sf`), with quotes or escapes (`"sf"`, `s\f`), as a zsh `=sf`, as a brace expansion (`{sf,}`), or as a glob (`s[f]`). A `-u`/`--targetusername` alias of `--target-org` counts as a target. The command table records these aliases for each command.
+
+Text in a commit message, a PR body, an `echo`, a `grep`/`rg` pattern, or a quoted heredoc is data. It does not cause a block.
+
+### Step 2: Classify each sf command
+
+`sf-command-table.json` lists all sf commands (with aliases, for example `deploy metadata` → `project deploy start`). For each command it records whether it takes `--target-org` or `--target-dev-hub`, whether it takes positional arguments, and every flag spelling with its arity (boolean or value). The guard uses the arity to parse arguments the way sf (oclif) does. So `-rw5` is read as `-r -w 5`, and in `--stream-to-file --target-org=x` the second word is a file name, not an org flag. A word after a known command id that the command cannot take as an argument (for example `sf org list purge`) makes the command unknown. sf also accepts command words in another order (`sf delete org sandbox` = `sf org delete sandbox`), and the guard resolves that order too. If the table cannot load, the guard blocks every sf command.
+
+| Command kind | Examples | Decision |
+|---|---|---|
+| Help | `--help`, `-h` | allow |
+| Local, or Dev Hub scratch org and beta package work (no `--target-org`) | `org list`, `config get`, `org create scratch -v hub`, `package version create`, `project deploy resume`, `project deploy report` | allow |
+| Read-only org commands | `data query`, `project retrieve start`, `org display`, `project deploy preview`, `sobject describe` | allow |
+| Dev Hub changes that cannot be undone or that affect subscribers | `package version promote`, `package delete`, `package version delete`, `package update`, `package version update`, `package push-upgrade abort` | **check the Dev Hub org** (needs `--target-dev-hub`) |
+| Destination org cannot be verified | `project deploy pipeline start/quick/validate`, `devops promote`, `devops promotion complete/validate`, `package push-upgrade schedule`, `org delete sandbox` (deletes through the production parent) | **block** |
+| All other org commands | `project deploy start/validate/quick/cancel`, `api request rest` (any method: a GET to `/tooling/executeAnonymous` runs Apex), `project delete source`, `apex run`, `apex run test`, `data create/update/delete/upsert/import`, `package install`, `org assign permset`, `org create user`, `org create sandbox` | **check the org** (step 3) |
+| Unknown commands (other plugins, newer CLI) | `sf sfdmu run ...`, `sf hardis ...` | **check the org** (step 3) |
+
+### Step 3: Require an explicit target
+
+A command that is checked must name its org with `--target-org <alias>` (or `-o`). Hidden aliases of that flag, such as `-u` and `--targetusername`, also count. The command table records them for each command. The guard does **not** use the default org, `SF_TARGET_ORG`, or `sf config`. These values depend on the folder and the environment, so the guard cannot read them reliably.
+
+`sf project deploy quick` and `sf project deploy cancel` use the org saved with the job in `~/.sf/deploy-cache.json` before they use `--target-org`. The guard checks that cached org too. Another deploy command in the same Bash call (for example `deploy resume`) can change that cache, so the guard blocks quick or cancel together with another deploy command. Run them as separate Bash commands. It reads short-flag clusters the way sf does (`-rw` = `-r -w`).
+
+The guard also blocks these cases:
+
+- The target value is a shell expansion (`-o "$ORG"`). Write the literal alias.
+- The command has two different targets.
+- A short-flag cluster hides the org flag (`-gu prod`). Write each flag separately.
+- The command uses `--flags-dir`, which can change the target.
+- The same Bash call changes an alias, login, or sf config (`sf alias set`, `sf org login ...`, `sf config set`) and also runs a checked command. The guard resolves the alias *before* the command runs, so the alias must not change in the same call.
+- The same Bash call sets `HOME`, `XDG_*`, or `SF_*`/`SFDX_*` variables (except harmless ones, such as `SF_LOG_LEVEL`).
+- The command name contains a shell expansion (`$C ...`, `eval "$C"`, `s${X:-f}`) in a command that can be a Salesforce command.
+- Inline code (`python3 -c`, `node -e`, `perl -e`, `osascript -e`, and similar) or an `ssh` remote command mentions Salesforce. The guard cannot check code in another language or on another machine.
+- `xargs` or `parallel` adds arguments to an `sf` command from its input, so the guard cannot see the full command. A complete read-only command (for example `xargs sf data query -q ... -o x`) is allowed.
+- `sudo`, `doas`, or `su` runs a checked `sf` command as another user. That user has other org logins.
+- A shell reads a script from a pipe (`... | bash`) and the command mentions Salesforce. A heredoc or here-string script (`bash <<EOF`) is parsed and checked like any other command.
+
+### Step 4: Check the org with live data
+
+For each target, the guard runs:
+
+```
+sf data query --query "SELECT Id, Name, IsSandbox, OrganizationType, TrialExpirationDate FROM Organization" --target-org <alias> --json
 ```
 
-Claude Code surfaces the reason to the model and the user, and the Bash call never runs.
-
-### Commands the hook intercepts
-
-- `sf project deploy start | validate | quick | cancel | report | resume | preview`
-- `sf deploy ...` (any subcommand)
-- `sfdx force:source:deploy`
-- `sfdx force:mdapi:deploy`
-- `sfdx force:source:push`
-
-These patterns are matched even when the deploy command is chained behind `cd ... && ...`, an inline env-var prefix, or a subshell. Non-deploy `sf` commands (e.g. `sf org list`, `sf data query`) pass through untouched.
-
-### Decision rule
-
-Checks are evaluated top-to-bottom. The first matching row wins.
-
-| Signal | Decision |
+| Live `Organization` data | Decision |
 |---|---|
-| User is active member of `Kelley-Austin/prod-deploy-admins` + local override file valid | **allow** (admin override) |
-| `isSandbox = true` | allow |
-| `isScratch = true` | allow |
-| `instanceUrl` matches `*.sandbox.my.salesforce.com` | allow |
-| `instanceUrl` matches `*.develop.my.salesforce.com` (Developer Edition) | allow |
-| `instanceUrl` matches `*.scratch.my.salesforce.com` | allow |
-| `instanceUrl` matches `*.pre.my.salesforce.com` or `prerellogin.pre.salesforce.com` (pre-release pods) | allow |
-| `OrganizationType` ∈ { Developer Edition, Partner Developer Edition, Personal Edition } | allow |
-| `TrialExpirationDate` is not null (trial / pre-release / signup) | allow |
-| Anything else (real Enterprise / Unlimited / Performance / Group / Professional / Base edition) | **deny** |
-| Org cannot be resolved or queried | **deny** (fail closed) |
+| `Id` is in `guard/allowed-orgs.json` and the entry has not expired | allow (demo org) |
+| `IsSandbox = true` | allow |
+| `OrganizationType` is `Developer Edition` or `Partner Developer Edition` | allow |
+| `TrialExpirationDate` is set (trials, scratch orgs, demo orgs that expire) | allow |
+| Anything else: Enterprise, Unlimited, Performance, Professional, Personal, Team, Base edition with no trial date | **block** |
+| The query fails, returns no record, or takes too long | **block** |
+
+The guard does not use the cached `isSandbox`/`isScratch` values from `sf org display`, or patterns in the instance URL. The live query is the only source.
+
+---
+
+## Demo orgs (IDO, SDO)
+
+Many IDOs and SDOs report `Enterprise Edition` or `Unlimited Edition` with no `TrialExpirationDate`. From live data alone, they look the same as a client's production org. To allow one, add its **Org ID** to `guard/allowed-orgs.json` by pull request:
+
+1. Get the Org ID: `sf data query -q "SELECT Id, Name, OrganizationType, TrialExpirationDate FROM Organization" -o <demo-alias>`
+2. Add an entry:
+
+   ```json
+   {
+     "orgs": [
+       { "orgId": "00D5g000000XXXXEAA", "label": "Axios IDO", "kind": "IDO", "owner": "marc.swan", "expires": "2027-03-31" }
+     ]
+   }
+   ```
+
+3. Open a PR. After it merges, each developer runs `bash install.sh` again.
+
+Rules:
+
+- Use the Org ID, never an alias. Anyone can rename an alias on their own machine. An Org ID is the same everywhere and never changes.
+- Set `expires` to a real date in `YYYY-MM-DD` format. The guard ignores an entry with no valid `expires` date, and an entry after that date.
+- Never add a client's production org.
 
 ---
 
 ## Installation
 
-### For all employees (required)
-
-Clone the repo and run the install script once per machine:
+Clone the repo and run the installer once on each machine. Run it again after each `git pull`.
 
 ```bash
 git clone https://github.com/Kelley-Austin/ka-vault.git ~/Documents/Perficient\ Projects/ka-vault
@@ -98,155 +140,94 @@ cd ~/Documents/Perficient\ Projects/ka-vault
 bash install.sh
 ```
 
-`install.sh` does three things:
+`install.sh` does these steps:
 
-1. Copies the hook script to `~/.local/share/ka-vault/hooks/` and registers it in `~/.claude/settings.json` so the guard is active for **every Claude Code session** on this machine.
-2. Installs the `cheese-backup-then-modify` helper to `~/.local/bin/` (a separate, non-security utility — see `bin/cheese-backup-then-modify -h`).
-3. Idempotently adds `"Bash(git *)"` to the `permissions.allow` array in `~/.claude/settings.json` so `git checkout`, `git merge`, `git status`, etc. don't trigger permission prompts in any Claude Code session. **This is independent of the prod-deploy block** — the hook intercepts `sf project deploy start|validate|quick|resume` regardless of what's in the allow list.
+1. Copies `guard/` to `~/.local/share/ka-vault/hooks/`. It stages the new files, tests them, and then replaces the installed files one at a time with an atomic rename. If the copy or the test fails, the old guard stays in place and keeps blocking. If a rename fails partway, the installed files can be from two versions: run install.sh again.
+2. Removes old guard registrations from `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json` when that variable is set), adds one correct registration, and verifies the result. It stops with an error if `disableAllHooks` is `true`.
+3. Runs a self-test with the registered command. A deploy with no target must give exit 2, and `git status` must give exit 0.
+4. Removes the admin override file from older versions.
+5. Installs the `cheese-backup-then-modify` helper to `~/.local/bin/`.
+6. Adds `"Bash(git *)"` to `permissions.allow` in `~/.claude/settings.json`.
 
-Restart any open Claude Code sessions afterward to pick up the changes.
+Restart open Claude Code sessions after you install.
 
 > **This is mandatory.** Every developer must run `install.sh` before using Claude Code on any Salesforce project.
 
 ### Requirements
 
-- Claude Code (any recent version that supports `PreToolUse` hooks)
-- Salesforce CLI (`sf`) on `PATH`. If `sf` is installed but not on the hook's `PATH`, the script also probes:
-  - `/opt/homebrew/bin/sf`
-  - `/usr/local/bin/sf`
-  - `~/.local/share/sf/bin/sf`
-- `jq` on `PATH` (preinstalled on most macOS dev setups; otherwise `brew install jq`)
-- `bash` (3.2+ — the macOS default works)
-
-### Activating the hook in an existing session
-
-Claude Code's settings watcher only picks up new `.claude/` entries when the session starts. If you installed mid-session:
-
-- Restart Claude Code.
-
-New sessions pick the hook up automatically after `install.sh` has been run.
+- Claude Code with `PreToolUse` hook support.
+- Node.js 18 or later. The `sf` CLI needs it too. The hook looks on `PATH`, then in `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, Volta, the sf installer folders, nvm, and the folder of the `sf` binary. If it finds no Node.js, it blocks every Bash command that mentions `sf` or Salesforce, uses ANSI-C quoting (`$'...'`), or has an expansion where a command name can be. This fallback is a simple text check, not a parser. Install Node.js to get the full guard.
+- The Salesforce CLI (`sf`). The hook looks on `PATH`, then in the usual install folders and nvm.
+- `jq`, for `install.sh` only. The hook does not need `jq`.
 
 ---
 
-## Admin override
+## Known limits
 
-Active members of the `Kelley-Austin/prod-deploy-admins` GitHub team can temporarily disable the guard on their own machine. The override is local, scoped to 24 hours, and automatically re-verified against GitHub at expiry.
+A hook only sees the text of the Bash command that Claude Code is about to run. These cases are outside its view:
 
-### Activating the override
+- **Scripts.** `bash deploy.sh`, `npm run deploy`, `make deploy`, and similar commands run code that the guard cannot see. Do not put production deploys in scripts in a Claude Code workspace.
+- **Shell aliases and functions.** Claude Code's Bash tool loads your shell profile. An alias or function there (for example `alias dp='sf project deploy start'`) hides `sf` from the guard. Do not define aliases or functions that wrap `sf` deploy or write commands.
+- **Other tools.** A Salesforce MCP server, or `curl` with an access token, does not go through `sf` in a Bash command. Do not connect a Salesforce MCP server to a production org in Claude Code.
+- **Hook timeout.** The guard kills a slow org query (the whole process group) and blocks after about 40 seconds. A Node watchdog blocks at 45 seconds. The wrapper starts Node under a 50-second `perl` alarm, which also stops Node when it is busy in synchronous code. Claude Code's limit for the hook is 60 seconds. If Claude Code stops the hook first, the hook cannot block.
+- **`bash -n`.** The guard skips `bash -n -c '...'` (syntax check only). It does not skip other shell options that prevent execution.
+
+The strongest control is credentials: do not authenticate production orgs on a machine where Claude Code runs Salesforce work.
+
+---
+
+## Policy decisions in this version
+
+- **No admin override.** The old 24-hour override let any deploy through, which broke the "never production" rule. Admins deploy to production through CI or from a terminal outside Claude Code.
+- **`project deploy validate` and `--dry-run` against production are blocked.** They do not save metadata. But they run tests in production, and a validated job lets `deploy quick` deploy it.
+- **Personal Edition is blocked.** It is a paid production edition, not a development org.
+- **Dev Hub packaging changes that cannot be undone are checked.** `package version promote`, `package delete`, `package version delete`, `package update`, `package version update`, and `package push-upgrade abort` check the Dev Hub org. A production Dev Hub blocks them.
+- **Scratch org, package create, and beta package version commands are allowed on a production Dev Hub.** They write records in the Dev Hub (`ScratchOrgInfo`, `Package2`, beta `Package2Version`). Dev Hubs are almost always production orgs, so blocking these commands would block all scratch org development. Decide as a team if `package create` and `package convert` must also be checked.
+- **`org delete sandbox` is blocked.** sf deletes the sandbox through its production parent org.
+- **`project deploy cancel` against production is blocked.** A cancel changes an active production deployment.
+- **`apex run test` and `apex tail log` against production are blocked.** Tests run code in production, and `apex tail log` creates trace flags.
+- **Sandbox create/refresh/delete against a production org is blocked.** These commands write to the production org.
+
+---
+
+## Testing
 
 ```bash
-bash ~/Documents/Perficient\ Projects/ka-vault/admin/setup.sh
+node --test tests/*.test.mjs
 ```
 
-This verifies your GitHub team membership via `gh` and writes a timestamped override file to `~/.local/share/ka-vault/admin-override`. The next Claude Code deploy check reads the file, confirms the timestamp is under 24 hours old, and allows the deploy.
+The tests run the real hook wrapper with a fake `sf`. They do not contact an org. They cover every bypass and false positive found in review, the fail-closed paths, and every allowed org type.
 
-After 24 hours, the hook re-queries GitHub. If you are still in the team, it renews automatically. If you have been removed from the team, the override is revoked.
-
-### Deactivating the override
+Test the installed hook by hand:
 
 ```bash
-bash ~/Documents/Perficient\ Projects/ka-vault/admin/disable.sh
+# blocked: no explicit target
+echo '{"tool_input":{"command":"sf project deploy start"}}' | bash ~/.local/share/ka-vault/hooks/block-sf-prod-deploy.sh; echo "exit $?"
+
+# allowed: text in a commit message
+echo '{"tool_input":{"command":"git commit -m \"sf project deploy start -o prod\""}}' | bash ~/.local/share/ka-vault/hooks/block-sf-prod-deploy.sh; echo "exit $?"
 ```
 
-Removes the override file immediately. The guard resumes for the next deploy attempt.
-
-### Adding / removing admins
-
-Admin access is controlled entirely through GitHub team membership — no code changes needed.
-
-- **Grant access:** Add the user to `Kelley-Austin/prod-deploy-admins` on GitHub.
-- **Revoke access:** Remove them from the team. Their override file will expire within 24 hours and fail re-verification.
-- **Immediate revocation:** Remove from team + ask them to run `admin/disable.sh`. Their next deploy attempt will also detect the removal and revoke the local file.
-
----
-
-## Usage
-
-There is nothing to invoke. Once the hook is active:
-
-```
-> claude code: deploy this to my prod org
-```
-
-```
-sf project deploy start --target-org PROD
-```
-
-The Bash call is intercepted before it executes. Claude Code receives a denial with a structured reason explaining that production deployments are forbidden, including the resolved alias, username, and instance URL for transparency.
-
-To deploy to a sandbox or scratch org, use the alias as normal:
-
-```
-sf project deploy start --target-org dev-sandbox -d force-app
-```
-
-The hook resolves `dev-sandbox`, sees `isSandbox=true`, and allows it.
-
----
-
-## Verifying the hook locally
-
-You can pipe-test the script directly without going through Claude Code:
+After a Salesforce CLI upgrade, or after you install an sf plugin, make the command table again:
 
 ```bash
-# non-deploy command (expect: empty stdout, exit 0)
-echo '{"tool_name":"Bash","tool_input":{"command":"sf org list"}}' \
-  | .claude/hooks/block-sf-prod-deploy.sh
-
-# documentation in echo (expect: pass-through)
-echo '{"tool_name":"Bash","tool_input":{"command":"echo sf project deploy start"}}' \
-  | .claude/hooks/block-sf-prod-deploy.sh
-
-# real deploy with bogus alias (expect: BLOCK JSON, exit 0)
-echo '{"tool_name":"Bash","tool_input":{"command":"sf project deploy start --target-org NOPE -d force-app"}}' \
-  | .claude/hooks/block-sf-prod-deploy.sh
+node guard/gen-sf-command-table.mjs && node --test tests/*.test.mjs
 ```
 
-The script always exits `0` — denial is communicated via the JSON body, per the Claude Code hook contract.
-
----
-
-## Repository layout
-
-```
-ka-vault/
-├── .claude/
-│   ├── settings.json                # registers the PreToolUse Bash hook (project-level)
-│   └── hooks/
-│       └── block-sf-prod-deploy.sh  # guard script (fail-closed)
-├── admin/
-│   ├── setup.sh                     # activate admin override (team members only)
-│   └── disable.sh                   # deactivate admin override
-├── install.sh                       # install hook globally into ~/.claude/settings.json
-└── README.md
-```
-
-`.claude/settings.json` is checked in so every contributor working in this repo gets the protection automatically. There is no `.claude/settings.local.json`; this guard is intentionally not user-overridable at the project level.
-
-The globally-installed copy (written by `install.sh`) lives at `~/.local/share/ka-vault/hooks/block-sf-prod-deploy.sh` and is registered in `~/.claude/settings.json`. It is functionally identical to the project-level copy.
-
----
-
-## Design notes
-
-- **Fail closed.** If `sf org display` errors, returns nothing, or returns malformed JSON, the deploy is denied. Better to block a legitimate sandbox push than allow a single accidental prod write.
-- **Target resolution.** The script honors explicit `--target-org` first, then falls back to whatever `sf` considers the current default — same resolution order as the deploy command itself, so the org being checked is the org that would be deployed to.
-- **No wrapper bypass.** Wrapping a deploy in a subshell, `cd && ...`, or a `VAR=foo sf ...` prefix does not evade the matcher. Hiding it inside `echo`, `printf`, or `cat` is not bypass either — those commands don't execute the deploy, so they're allowed.
-- **Decoupled from validate vs. start.** All `sf project deploy` subcommands are gated, including `validate` and `quick`. `validate` against production consumes a deployment slot, and `quick` will actually deploy a previously-validated package. Both are blocked when the target is production.
-- **Admin override is GitHub-authoritative.** The bypass check is verified against the GitHub API, not a local secret. Removing someone from the `prod-deploy-admins` team on GitHub is the single revocation action; no hook code needs to change.
-- **Admin override is machine-local.** The override file at `~/.local/share/ka-vault/admin-override` does not exist in the repo and has no effect on other users' machines.
-- **No exceptions for non-admins.** The hook does not honor an env-var override, a magic flag, or a comment marker for regular users. If a non-admin needs to deploy to production, they must do it from a standard terminal outside Claude Code.
+A command that is not in the table is treated as a write, so an old table usually causes a false block, not a missed write. One exception: a new subcommand under an existing command that takes positional arguments (for example `sf config get <new-word>`) is read as that existing command. Make the table again after each sf upgrade or plugin install.
 
 ---
 
 ## Troubleshooting
 
-**The hook didn't fire.** Restart Claude Code — it reads `~/.claude/settings.json` at session start. If the global settings were updated while the session was already open, the hook won't load until restart.
+**The hook did not fire.** Restart Claude Code. It reads `~/.claude/settings.json` when the session starts.
 
-**It blocks everything, even sandbox deploys.** Confirm `sf` is on the hook shell's `PATH` and `sf org display --target-org <your-alias> --json` succeeds in your terminal. If `sf org display` returns `DomainNotFoundError`, the auth file is stale — re-authenticate with `sf org login web --instance-url <url>` and retry. The hook recognizes sandboxes by URL pattern even when stale auth lies about `isSandbox`, but it cannot recognize anything if the org won't resolve at all.
+**It blocks a deploy to my sandbox.** Read the reason in the message.
 
-**It blocked a deploy whose target org I haven't authenticated yet.** That's correct fail-closed behavior. Authenticate the org first with `sf org login web`, then retry.
+- "Add an explicit --target-org": add `-o <alias>` to the command.
+- "Cannot confirm that org ... is not production": run `sf org list` and `sf data query -q "SELECT IsSandbox FROM Organization" -o <alias>` in a terminal. If the login has expired, run `sf org login web -a <alias> -r https://test.salesforce.com`.
+- "is a PRODUCTION org" for a demo org: add its Org ID to `guard/allowed-orgs.json` (see [Demo orgs](#demo-orgs-ido-sdo)).
 
-**Admin override isn't working.** Confirm `gh auth status` succeeds and that you are an active (not pending) member of `Kelley-Austin/prod-deploy-admins`. Run `admin/setup.sh` again to refresh the cache.
+**It blocks a command that only reads.** Run `node guard/gen-sf-command-table.mjs`. If the command is still blocked, open an issue so the team can add it to the read-only list in `guard/guard-lib.mjs`.
 
-**I want it disabled (non-admin).** Don't disable it. If you need to deploy to production, use a standard terminal session outside Claude Code.
+**I need to deploy to production.** Use CI, or a terminal outside Claude Code.

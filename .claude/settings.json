@@ -7,8 +7,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/block-sf-prod-deploy.sh\"",
-            "timeout": 30
+            "command": "/bin/bash \"$CLAUDE_PROJECT_DIR/guard/block-sf-prod-deploy.sh\"",
+            "timeout": 60
           }
         ]
       }
