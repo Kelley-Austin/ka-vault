@@ -1,9 +1,6 @@
 # ka-vault
 
-ka-vault is the Kelley Austin toolkit for Salesforce work with Claude Code. It contains two tools:
-
-- **`sf-prod-guard`**, a Claude Code plugin that **blocks every Salesforce CLI command that can change a production org**. There are no exceptions and no override.
-- **`cheese-backup-then-modify`**, a helper that saves the current org metadata to a git branch before you change it.
+ka-vault contains **`sf-prod-guard`**, the Kelley Austin Claude Code plugin that **blocks every Salesforce CLI command that can change a production org**. There are no exceptions and no override.
 
 The guard allows writes to these orgs:
 
@@ -31,7 +28,6 @@ The guard fails closed. If it cannot prove that the target org is not production
 - [What the guard allows and blocks](#what-the-guard-allows-and-blocks)
 - [How it works](#how-it-works)
 - [Demo orgs (IDO, SDO)](#demo-orgs-ido-sdo)
-- [Backup helper](#backup-helper)
 - [Repository layout](#repository-layout)
 - [Configuration reference](#configuration-reference)
 - [Known limits](#known-limits)
@@ -107,14 +103,13 @@ Use this option on a new machine, and on a machine that had an older version of 
 3. Turns on automatic updates for the `ka-vault` marketplace.
 4. Runs a self-test with the installed hook. A deploy with no target must give exit code 2 (block), and `git status` must give exit code 0 (allow). If the test fails, the script stops before step 5.
 5. Removes the hook registration and the files of older ka-vault versions (`~/.local/share/ka-vault/`). Without this step, the guard runs twice.
-6. Installs the [backup helper](#backup-helper) to `~/.local/bin/`.
-7. Adds `"Bash(git *)"` to `permissions.allow` in your user settings, so git commands do not ask for permission.
+6. Adds `"Bash(git *)"` to `permissions.allow` in your user settings, so git commands do not ask for permission.
 
 You can run `install.sh` again at any time. It does not add duplicates.
 
 ### Option B: install from Claude Code
 
-Use this option only on a machine that never had an older ka-vault version. This option does not remove an old hook registration, does not turn on automatic updates, and does not install the backup helper.
+Use this option only on a machine that never had an older ka-vault version. This option does not remove an old hook registration and does not turn on automatic updates.
 
 1. In Claude Code, run these two commands:
 
@@ -161,7 +156,7 @@ Two stricter keys are available. They also affect every developer's other plugin
 - `"allowManagedHooksOnly": true` runs only managed hooks and the hooks of plugins that managed settings enable. The guard still runs. Hooks from other plugins and from user or project settings stop.
 - `strictKnownMarketplaces` allows plugins only from the marketplaces in its list.
 
-Developers still run `install.sh` once for the backup helper and to remove the old hook registration.
+Developers still run `install.sh` once to remove the old hook registration.
 
 See the Claude Code docs: [managed settings](https://code.claude.com/docs/en/managed-settings) and [plugins for organizations](https://code.claude.com/docs/en/plugins/org).
 
@@ -408,31 +403,6 @@ Rules:
 
 ---
 
-## Backup helper
-
-`cheese-backup-then-modify` saves the current org version of some metadata to a git branch before you change it. A bad change is then easy to undo, also for people who do not know git well. `install.sh` copies it to `~/.local/bin/`.
-
-```bash
-cheese-backup-then-modify <path> [--from-org <alias>]
-```
-
-- `<path>`: a file or folder inside `force-app/`.
-- `--from-org <alias>`: the org to retrieve from. If you do not give it, the helper uses the project's default org (`sf config get target-org`).
-
-The helper does these steps:
-
-1. Puts your unrelated uncommitted changes aside (`git stash`).
-2. Retrieves `<path>` from the org with `sf project retrieve start --source-dir <path>`.
-3. If the retrieved files are the same as the files in your last commit, it stops: no backup is necessary.
-4. Otherwise it creates the branch `backup/<path>-<timestamp>`, commits the retrieved files, and pushes the branch. If the push fails, the local commit is still a valid backup.
-5. Goes back to your branch and restores your changes.
-
-It prints one line of JSON, for example `{"status": "backed_up", "backup_branch": "backup/..."}` or `{"status": "no_backup_needed", ...}`. It exits with code 0 on success. Run `cheese-backup-then-modify -h` for help.
-
-`~/.local/bin` must be on your `PATH`. If it is not, `install.sh` tells you what to add to your shell profile.
-
----
-
 ## Repository layout
 
 ```
@@ -449,9 +419,8 @@ plugins/sf-prod-guard/
     ├── gen-sf-command-table.mjs    # makes sf-command-table.json again from the installed sf CLI
     └── allowed-orgs.json           # Org ID allowlist for demo orgs (IDO, SDO)
 managed/managed-settings.json       # policy that makes the plugin mandatory (Option C)
-bin/cheese-backup-then-modify       # backup helper
 tests/guard.test.mjs                # end-to-end tests with a fake sf (no org access)
-install.sh                          # installs the plugin, removes the old hook, installs the helper
+install.sh                          # installs the plugin and removes the old hook
 ```
 
 `.claude/settings.json` adds the `ka-vault` marketplace and enables `sf-prod-guard@ka-vault` for sessions in this repo. Claude Code applies it after you trust the folder. So a teammate who opens this repo gets the guard in this repo even before they run `install.sh`. Only the user install (Option A or B) or managed settings (Option C) protect their other projects.

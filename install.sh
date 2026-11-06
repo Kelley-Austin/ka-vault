@@ -19,16 +19,12 @@
 
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MARKETPLACE_SOURCE="${KA_VAULT_MARKETPLACE:-Kelley-Austin/ka-vault}"
 MARKETPLACE_NAME="ka-vault"
 PLUGIN="sf-prod-guard@${MARKETPLACE_NAME}"
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}"
 GLOBAL_SETTINGS="${CLAUDE_DIR}/settings.json"
 OLD_HOOK_DIR="${HOME}/.local/share/ka-vault/hooks"
-SRC_BACKUP_HELPER="${REPO_DIR}/bin/cheese-backup-then-modify"
-DEST_BIN_DIR="${HOME}/.local/bin"
-DEST_BACKUP_HELPER="${DEST_BIN_DIR}/cheese-backup-then-modify"
 
 # ── 1. Verify requirements ────────────────────────────────────────────────────
 
@@ -137,23 +133,10 @@ if [ -d "$OLD_HOOK_DIR" ]; then
 fi
 rm -f "${HOME}/.local/share/ka-vault/admin-override"
 
-# ── 5. Helpers ────────────────────────────────────────────────────────────────
-
-# Install cheese-backup-then-modify onto PATH (~/.local/bin)
-if [ -f "$SRC_BACKUP_HELPER" ]; then
-  mkdir -p "$DEST_BIN_DIR"
-  cp "$SRC_BACKUP_HELPER" "$DEST_BACKUP_HELPER"
-  chmod +x "$DEST_BACKUP_HELPER"
-  echo "✓ Backup helper copied to ${DEST_BACKUP_HELPER}"
-  case ":${PATH}:" in
-    *":${DEST_BIN_DIR}:"*) : ;;
-    *) echo "  ⚠️  ${DEST_BIN_DIR} is not on your PATH. Add it to your shell rc:" >&2
-       echo "       export PATH=\"\$HOME/.local/bin:\$PATH\"" >&2 ;;
-  esac
-fi
+# ── 5. Permissions ────────────────────────────────────────────────────────────
 
 # Allowlist Bash(git *) globally so git commands don't hit permission prompts
-# in any Claude Code session — including project-cwd sessions launched by CHEESE.
+# in any Claude Code session.
 if jq -e '(.permissions.allow // []) | index("Bash(git *)")' "$GLOBAL_SETTINGS" >/dev/null 2>&1; then
   echo "✓ Bash(git *) already in ${GLOBAL_SETTINGS} allow list — nothing to do"
 else
