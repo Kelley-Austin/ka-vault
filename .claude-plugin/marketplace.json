@@ -1,0 +1,15 @@
+{
+  "name": "ka-vault",
+  "owner": {
+    "name": "Kelley Austin",
+    "url": "https://github.com/Kelley-Austin"
+  },
+  "description": "Kelley Austin Claude Code plugins for Salesforce work.",
+  "plugins": [
+    {
+      "name": "sf-prod-guard",
+      "source": "./plugins/sf-prod-guard",
+      "description": "Blocks Salesforce CLI commands that can change a production org."
+    }
+  ]
+}

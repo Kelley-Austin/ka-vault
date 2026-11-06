@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// Regenerate guard/sf-command-table.json from the installed sf CLI.
+// Regenerate plugins/sf-prod-guard/guard/sf-command-table.json from the installed sf CLI.
 // Run after a Salesforce CLI upgrade, or after you install an sf plugin:
-//   node guard/gen-sf-command-table.mjs
+//   node plugins/sf-prod-guard/guard/gen-sf-command-table.mjs
 // The guard treats a command that is not in the table as a write. It then
 // requires --target-org and checks the org. So a stale table can only cause a
 // false positive, never a missed production write.

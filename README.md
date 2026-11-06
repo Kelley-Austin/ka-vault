@@ -1,6 +1,6 @@
 # ka-vault
 
-A Claude Code hook that **blocks every Salesforce CLI command that can change a production org**. There are no exceptions and no override.
+A Claude Code plugin, `sf-prod-guard`, that **blocks every Salesforce CLI command that can change a production org**. There are no exceptions and no override.
 
 The guard allows writes to these orgs:
 
@@ -25,15 +25,20 @@ A person must start every production deployment on purpose, from a CI pipeline o
 Claude Code runs a `PreToolUse` hook before each Bash command. The hook gets the command as JSON on stdin. It allows the command with exit code `0`, or blocks it with exit code `2`. When it blocks, Claude Code shows the reason (stderr) to the model.
 
 ```
-guard/
-├── block-sf-prod-deploy.sh   # hook entry: finds Node.js, changes every failure into exit 2
-├── sf-prod-guard.mjs         # Node entry point
-├── guard-lib.mjs             # shell parser, command classification, org check
-├── sf-command-table.json     # every sf command and whether it takes --target-org (generated)
-├── gen-sf-command-table.mjs  # makes sf-command-table.json again from the installed CLI
-└── allowed-orgs.json         # Org ID allowlist for demo orgs (IDO/SDO)
-tests/guard.test.mjs          # end-to-end tests with a fake sf (no org access)
-install.sh                    # installs the guard for all Claude Code sessions
+.claude-plugin/marketplace.json     # this repo is a plugin marketplace named "ka-vault"
+plugins/sf-prod-guard/
+├── .claude-plugin/plugin.json      # plugin manifest
+├── hooks/hooks.json                # PreToolUse hook for Bash: timeout 60 s, onFailure "block"
+└── guard/
+    ├── block-sf-prod-deploy.sh     # hook entry: finds Node.js, changes every failure into exit 2
+    ├── sf-prod-guard.mjs           # Node entry point
+    ├── guard-lib.mjs               # shell parser, command classification, org check
+    ├── sf-command-table.json       # every sf command and whether it takes --target-org (generated)
+    ├── gen-sf-command-table.mjs    # makes sf-command-table.json again from the installed CLI
+    └── allowed-orgs.json           # Org ID allowlist for demo orgs (IDO/SDO)
+managed/managed-settings.json       # example policy that makes the plugin mandatory
+tests/guard.test.mjs                # end-to-end tests with a fake sf (no org access)
+install.sh                          # installs the plugin and removes the old hook
 ```
 
 ### Step 1: Parse the command as shell syntax
@@ -94,7 +99,7 @@ sf data query --query "SELECT Id, Name, IsSandbox, OrganizationType, TrialExpira
 
 | Live `Organization` data | Decision |
 |---|---|
-| `Id` is in `guard/allowed-orgs.json` and the entry has not expired | allow (demo org) |
+| `Id` is in `plugins/sf-prod-guard/guard/allowed-orgs.json` and the entry has not expired | allow (demo org) |
 | `IsSandbox = true` | allow |
 | `OrganizationType` is `Developer Edition` or `Partner Developer Edition` | allow |
 | `TrialExpirationDate` is set (trials, scratch orgs, demo orgs that expire) | allow |
@@ -107,7 +112,7 @@ The guard does not use the cached `isSandbox`/`isScratch` values from `sf org di
 
 ## Demo orgs (IDO, SDO)
 
-Many IDOs and SDOs report `Enterprise Edition` or `Unlimited Edition` with no `TrialExpirationDate`. From live data alone, they look the same as a client's production org. To allow one, add its **Org ID** to `guard/allowed-orgs.json` by pull request:
+Many IDOs and SDOs report `Enterprise Edition` or `Unlimited Edition` with no `TrialExpirationDate`. From live data alone, they look the same as a client's production org. To allow one, add its **Org ID** to `plugins/sf-prod-guard/guard/allowed-orgs.json` by pull request:
 
 1. Get the Org ID: `sf data query -q "SELECT Id, Name, OrganizationType, TrialExpirationDate FROM Organization" -o <demo-alias>`
 2. Add an entry:
@@ -120,7 +125,7 @@ Many IDOs and SDOs report `Enterprise Edition` or `Unlimited Edition` with no `T
    }
    ```
 
-3. Open a PR. After it merges, each developer runs `bash install.sh` again.
+3. Open a PR. After it merges, the change reaches each developer with the next plugin update (see [Updates](#updates)).
 
 Rules:
 
@@ -132,7 +137,7 @@ Rules:
 
 ## Installation
 
-Clone the repo and run the installer once on each machine. Run it again after each `git pull`.
+The guard is a Claude Code plugin. This repo is its marketplace. Clone the repo and run the installer once on each machine:
 
 ```bash
 git clone https://github.com/Kelley-Austin/ka-vault.git ~/Documents/Perficient\ Projects/ka-vault
@@ -142,23 +147,80 @@ bash install.sh
 
 `install.sh` does these steps:
 
-1. Copies `guard/` to `~/.local/share/ka-vault/hooks/`. It stages the new files, tests them, and then replaces the installed files one at a time with an atomic rename. If the copy or the test fails, the old guard stays in place and keeps blocking. If a rename fails partway, the installed files can be from two versions: run install.sh again.
-2. Removes old guard registrations from `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json` when that variable is set), adds one correct registration, and verifies the result. It stops with an error if `disableAllHooks` is `true`.
-3. Runs a self-test with the registered command. A deploy with no target must give exit 2, and `git status` must give exit 0.
-4. Removes the admin override file from older versions.
+1. Stops with an error if `disableAllHooks` is `true` in `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json` when that variable is set).
+2. Adds the `ka-vault` marketplace (`Kelley-Austin/ka-vault` on GitHub) and installs `sf-prod-guard@ka-vault` for your user. If the plugin is already installed, it updates it. It enables the plugin if it is turned off.
+3. Runs a self-test with the installed hook. A deploy with no target must give exit 2, and `git status` must give exit 0. If the test fails, the script stops before step 4.
+4. Removes the hook registration and the files of older ka-vault versions (`~/.local/share/ka-vault/`). Without this step, the guard would run twice.
 5. Installs the `cheese-backup-then-modify` helper to `~/.local/bin/`.
 6. Adds `"Bash(git *)"` to `permissions.allow` in `~/.claude/settings.json`.
 
 Restart open Claude Code sessions after you install.
 
-> **This is mandatory.** Every developer must run `install.sh` before using Claude Code on any Salesforce project.
+To install without the script, run these two commands in a terminal, or the same commands with `/plugin` inside Claude Code:
+
+```bash
+claude plugin marketplace add Kelley-Austin/ka-vault
+claude plugin install sf-prod-guard@ka-vault
+```
+
+If you used an older version of ka-vault, also run `install.sh` once, or remove the `block-sf-prod-deploy` entry from `~/.claude/settings.json` yourself.
+
+> **This is mandatory.** Every developer must install the plugin before using Claude Code on any Salesforce project.
+
+### In this repo
+
+`.claude/settings.json` adds the `ka-vault` marketplace and enables `sf-prod-guard@ka-vault` for this project. Claude Code applies these settings after you trust the folder. A teammate who opens this repo gets the guard in this project even before they run `install.sh`. Only the user install (or managed settings) protects their other projects.
+
+### Updates
+
+`plugin.json` has no `version` field on purpose. Claude Code then uses the commit SHA as the version, so each commit merged to `main` is a new plugin version. Do not add a `version` field: with one, users stay on that version until someone changes it, and a guard fix would not reach them.
+
+To get the newest guard now:
+
+```bash
+claude plugin marketplace update ka-vault && claude plugin update sf-prod-guard@ka-vault
+```
+
+Or run `bash install.sh` again. Restart Claude Code after an update.
+
+The machine needs read access to the `Kelley-Austin/ka-vault` GitHub repo to add the marketplace and to get updates.
+
+### Managed settings (make the guard mandatory)
+
+A developer can turn a plugin off with `/plugin` or `claude plugin disable`. To make the guard mandatory on company machines, an admin deploys managed settings. [`managed/managed-settings.json`](managed/managed-settings.json) is a ready policy:
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "ka-vault": { "source": { "source": "github", "repo": "Kelley-Austin/ka-vault" }, "autoUpdate": true }
+  },
+  "enabledPlugins": { "sf-prod-guard@ka-vault": true }
+}
+```
+
+A plugin that managed settings enable stays on. A user cannot turn it off in their own settings. Deploy the policy one of these ways:
+
+| Method | Where |
+| --- | --- |
+| File | macOS `/Library/Application Support/ClaudeCode/managed-settings.json`, Linux and WSL `/etc/claude-code/managed-settings.json`, Windows `C:\Program Files\ClaudeCode\managed-settings.json`. A file in `managed-settings.d/` next to it also works. |
+| MDM | macOS profile for the `com.anthropic.claudecode` domain. Windows registry value `Settings` under `HKLM\SOFTWARE\Policies\ClaudeCode`. |
+| Server-managed (Claude for Teams and Enterprise) | claude.ai, Organization settings > Claude Code > Managed settings. An Owner sets the JSON. |
+
+By default, only one managed source applies on a machine: server-managed first, then MDM, then the file. If you already use one of them for other policy, add these keys to it.
+
+Optional, stricter keys (they affect every developer's other plugins and hooks, so agree on them first):
+
+- `"allowManagedHooksOnly": true` runs only managed hooks and hooks of plugins that managed settings enable. The guard still runs. Hooks from other plugins and from user or project settings stop.
+- `strictKnownMarketplaces` allows plugins only from listed marketplaces.
+
+See the Claude Code docs: [managed settings](https://code.claude.com/docs/en/managed-settings) and [plugins for organizations](https://code.claude.com/docs/en/plugins/org).
 
 ### Requirements
 
-- Claude Code with `PreToolUse` hook support.
+- Claude Code with plugin support. Version 2.1.295 or later is recommended: earlier versions ignore `onFailure`, so a guard crash or timeout does not block there.
 - Node.js 18 or later. The `sf` CLI needs it too. The hook looks on `PATH`, then in `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, Volta, the sf installer folders, nvm, and the folder of the `sf` binary. If it finds no Node.js, it blocks every Bash command that mentions `sf` or Salesforce, uses ANSI-C quoting (`$'...'`), or has an expansion where a command name can be. This fallback is a simple text check, not a parser. Install Node.js to get the full guard.
 - The Salesforce CLI (`sf`). The hook looks on `PATH`, then in the usual install folders and nvm.
-- `jq`, for `install.sh` only. The hook does not need `jq`.
+- `jq` and the `claude` CLI, for `install.sh` only. The hook does not need `jq`.
 
 ---
 
@@ -169,7 +231,7 @@ A hook only sees the text of the Bash command that Claude Code is about to run. 
 - **Scripts.** `bash deploy.sh`, `npm run deploy`, `make deploy`, and similar commands run code that the guard cannot see. Do not put production deploys in scripts in a Claude Code workspace.
 - **Shell aliases and functions.** Claude Code's Bash tool loads your shell profile. An alias or function there (for example `alias dp='sf project deploy start'`) hides `sf` from the guard. Do not define aliases or functions that wrap `sf` deploy or write commands.
 - **Other tools.** A Salesforce MCP server, or `curl` with an access token, does not go through `sf` in a Bash command. Do not connect a Salesforce MCP server to a production org in Claude Code.
-- **Hook timeout.** The guard kills a slow org query (the whole process group) and blocks after about 40 seconds. A Node watchdog blocks at 45 seconds. The wrapper starts Node under a 50-second `perl` alarm, which also stops Node when it is busy in synchronous code. Claude Code's limit for the hook is 60 seconds. If Claude Code stops the hook first, the hook cannot block.
+- **Hook timeout.** The guard kills a slow org query (the whole process group) and blocks after about 40 seconds. A Node watchdog blocks at 45 seconds. The wrapper starts Node under a 50-second `perl` alarm, which also stops Node when it is busy in synchronous code. Claude Code's limit for the hook is 60 seconds. The hook sets `"onFailure": "block"`, so if Claude Code stops the hook, or the hook ends with an exit code other than 0 or 2, Claude Code blocks the command. Claude Code versions before 2.1.295 do not support `onFailure`. There, a stopped hook does not block.
 - **`bash -n`.** The guard skips `bash -n -c '...'` (syntax check only). It does not skip other shell options that prevent execution.
 
 The strongest control is credentials: do not authenticate production orgs on a machine where Claude Code runs Salesforce work.
@@ -198,20 +260,20 @@ node --test tests/*.test.mjs
 
 The tests run the real hook wrapper with a fake `sf`. They do not contact an org. They cover every bypass and false positive found in review, the fail-closed paths, and every allowed org type.
 
-Test the installed hook by hand:
+Test the hook by hand (from the repo root):
 
 ```bash
 # blocked: no explicit target
-echo '{"tool_input":{"command":"sf project deploy start"}}' | bash ~/.local/share/ka-vault/hooks/block-sf-prod-deploy.sh; echo "exit $?"
+echo '{"tool_input":{"command":"sf project deploy start"}}' | bash plugins/sf-prod-guard/guard/block-sf-prod-deploy.sh; echo "exit $?"
 
 # allowed: text in a commit message
-echo '{"tool_input":{"command":"git commit -m \"sf project deploy start -o prod\""}}' | bash ~/.local/share/ka-vault/hooks/block-sf-prod-deploy.sh; echo "exit $?"
+echo '{"tool_input":{"command":"git commit -m \"sf project deploy start -o prod\""}}' | bash plugins/sf-prod-guard/guard/block-sf-prod-deploy.sh; echo "exit $?"
 ```
 
 After a Salesforce CLI upgrade, or after you install an sf plugin, make the command table again:
 
 ```bash
-node guard/gen-sf-command-table.mjs && node --test tests/*.test.mjs
+node plugins/sf-prod-guard/guard/gen-sf-command-table.mjs && node --test tests/*.test.mjs
 ```
 
 A command that is not in the table is treated as a write, so an old table usually causes a false block, not a missed write. One exception: a new subcommand under an existing command that takes positional arguments (for example `sf config get <new-word>`) is read as that existing command. Make the table again after each sf upgrade or plugin install.
@@ -220,14 +282,14 @@ A command that is not in the table is treated as a write, so an old table usuall
 
 ## Troubleshooting
 
-**The hook did not fire.** Restart Claude Code. It reads `~/.claude/settings.json` when the session starts.
+**The hook did not fire.** Run `claude plugin list` and make sure that `sf-prod-guard@ka-vault` is enabled. Then restart Claude Code. It loads plugins and hooks when the session starts.
 
 **It blocks a deploy to my sandbox.** Read the reason in the message.
 
 - "Add an explicit --target-org": add `-o <alias>` to the command.
 - "Cannot confirm that org ... is not production": run `sf org list` and `sf data query -q "SELECT IsSandbox FROM Organization" -o <alias>` in a terminal. If the login has expired, run `sf org login web -a <alias> -r https://test.salesforce.com`.
-- "is a PRODUCTION org" for a demo org: add its Org ID to `guard/allowed-orgs.json` (see [Demo orgs](#demo-orgs-ido-sdo)).
+- "is a PRODUCTION org" for a demo org: add its Org ID to `plugins/sf-prod-guard/guard/allowed-orgs.json` (see [Demo orgs](#demo-orgs-ido-sdo)).
 
-**It blocks a command that only reads.** Run `node guard/gen-sf-command-table.mjs`. If the command is still blocked, open an issue so the team can add it to the read-only list in `guard/guard-lib.mjs`.
+**It blocks a command that only reads.** Run `node plugins/sf-prod-guard/guard/gen-sf-command-table.mjs`. If the command is still blocked, open an issue so the team can add it to the read-only list in `plugins/sf-prod-guard/guard/guard-lib.mjs`.
 
 **I need to deploy to production.** Use CI, or a terminal outside Claude Code.

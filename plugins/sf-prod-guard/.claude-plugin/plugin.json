@@ -1,0 +1,17 @@
+{
+  "name": "sf-prod-guard",
+  "description": "Blocks Salesforce CLI commands that can change a production org. Allows sandboxes, scratch orgs, Developer Edition orgs, trial orgs, and allowlisted demo orgs (IDO/SDO).",
+  "author": {
+    "name": "Kelley Austin",
+    "url": "https://github.com/Kelley-Austin"
+  },
+  "repository": "https://github.com/Kelley-Austin/ka-vault",
+  "keywords": [
+    "salesforce",
+    "sf",
+    "guard",
+    "production",
+    "deploy",
+    "hook"
+  ]
+}
