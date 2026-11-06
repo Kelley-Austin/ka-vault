@@ -30,6 +30,16 @@ find_node() {
            "$HOME/.local/share/sf/client/bin/node" "$HOME"/.nvm/versions/node/*/bin/node; do
     if [ -x "$c" ]; then printf '%s' "$c"; return; fi
   done
+  # The sf installer ships its own Node next to the sf binary.
+  local sfbin sfdir
+  sfbin="$(command -v sf 2>/dev/null)"
+  if [ -n "$sfbin" ]; then
+    sfbin="$(readlink -f "$sfbin" 2>/dev/null || printf '%s' "$sfbin")"
+    sfdir="$(dirname "$sfbin")"
+    for c in "$sfdir/node" "$sfdir/../bin/node" "$sfdir/../client/bin/node"; do
+      if [ -x "$c" ]; then printf '%s' "$c"; return; fi
+    done
+  fi
 }
 
 NODE="$(find_node)"
@@ -48,7 +58,13 @@ if [ -z "$NODE" ]; then
   [ -z "$CMD_TEXT" ] && CMD_TEXT="$INPUT"
   shopt -s nocasematch
   STRIPPED="${CMD_TEXT//[\'\"\\]/}"
-  if [[ "$STRIPPED" == *sf* || "$STRIPPED" == *salesforce* ]]; then
+  # Also block text that can hide an sf call: ANSI-C quoting ($'\x73\x66'),
+  # and an expansion or a backtick in the command-name position (at the start,
+  # or after ; & | ( { or a newline, after optional NAME=value words).
+  CMD_POS_EXPANSION=$'(^|[;&|({\n`])[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*["\']?(\\$|`)'
+  if [[ "$STRIPPED" == *sf* || "$STRIPPED" == *salesforce* ]] \
+     || [[ "$CMD_TEXT" == *"\$'"* ]] \
+     || [[ "$CMD_TEXT" =~ $CMD_POS_EXPANSION ]]; then
     echo "ka-vault guard: BLOCKED. Node.js is not available to the hook, so the guard cannot check Salesforce commands. Install Node.js (the sf CLI needs it too), then restart Claude Code." >&2
     exit 2
   fi

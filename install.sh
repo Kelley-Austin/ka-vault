@@ -147,8 +147,11 @@ echo "✓ Self-test passed (a deploy with no --target-org is blocked; git status
 if jq -e '(.permissions.allow // []) | index("Bash(git *)")' "$GLOBAL_SETTINGS" >/dev/null 2>&1; then
   echo "✓ Bash(git *) already in ${GLOBAL_SETTINGS} allow list — nothing to do"
 else
-  UPDATED="$(jq '.permissions.allow //= [] | .permissions.allow += ["Bash(git *)"]' "$GLOBAL_SETTINGS")"
-  printf '%s\n' "$UPDATED" > "$GLOBAL_SETTINGS"
+  # Write a temporary file, then rename it. A failed write never truncates the settings.
+  TMP_SETTINGS="$(mktemp "${GLOBAL_SETTINGS}.XXXXXX")"
+  jq '.permissions.allow //= [] | .permissions.allow += ["Bash(git *)"]' "$GLOBAL_SETTINGS" > "$TMP_SETTINGS"
+  jq -e . "$TMP_SETTINGS" >/dev/null
+  mv "$TMP_SETTINGS" "$GLOBAL_SETTINGS"
   echo "✓ Bash(git *) added to ${GLOBAL_SETTINGS} allow list"
 fi
 

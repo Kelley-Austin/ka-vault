@@ -46,7 +46,7 @@ The guard does not search the command text with a regex. It parses the command t
 - `$(...)`, backticks, `<(...)`, and subshells
 - `&&`, `||`, `;`, `|`, and new lines
 
-It then finds each `sf` or `sfdx` call, also behind wrappers: `env`, `sudo`, `time`, `timeout`, `xargs`, `command`, `exec`, `script`, `find -exec`, `npx @salesforce/cli`, `npm exec`, `node .../@salesforce/cli/bin/run.js`, `bash -c`, `sh -c`, `eval`, and `watch`. It also finds `sf` when the command name is written as a path (`/opt/homebrew/bin/sf`), with quotes or escapes (`"sf"`, `s\f`), as a zsh `=sf`, as a brace expansion (`{sf,}`), or as a glob (`s[f]`). A `-u`/`--targetusername` alias of `--target-org` counts as a target. The command table records these aliases for each command.
+It then finds each `sf` or `sfdx` call, also behind wrappers: `env`, `sudo`, `time`, `timeout`, `xargs`, `command`, `exec`, `script`, `find -exec`, `npx @salesforce/cli`, `npm exec`, `node .../@salesforce/cli/bin/run.js`, `bash -c`, `sh -c`, `eval`, and `watch`. It also checks the parts of `awk` (`system()`, `getline`, pipes), GNU `sed` (the `e` command), and `git -c` that can run commands. It also finds `sf` when the command name is written as a path (`/opt/homebrew/bin/sf`), with quotes or escapes (`"sf"`, `s\f`), as a zsh `=sf`, as a brace expansion (`{sf,}`), or as a glob (`s[f]`). A `-u`/`--targetusername` alias of `--target-org` counts as a target. The command table records these aliases for each command.
 
 Text in a commit message, a PR body, an `echo`, a `grep`/`rg` pattern, or a quoted heredoc is data. It does not cause a block.
 
@@ -68,7 +68,7 @@ Text in a commit message, a PR body, an `echo`, a `grep`/`rg` pattern, or a quot
 
 A command that is checked must name its org with `--target-org <alias>` (or `-o`). Hidden aliases of that flag, such as `-u` and `--targetusername`, also count. The command table records them for each command. The guard does **not** use the default org, `SF_TARGET_ORG`, or `sf config`. These values depend on the folder and the environment, so the guard cannot read them reliably.
 
-`sf project deploy quick` and `sf project deploy cancel` use the org saved with the job in `~/.sf/deploy-cache.json` before they use `--target-org`. The guard checks that cached org too. It reads short-flag clusters the way sf does (`-rw` = `-r -w`).
+`sf project deploy quick` and `sf project deploy cancel` use the org saved with the job in `~/.sf/deploy-cache.json` before they use `--target-org`. The guard checks that cached org too. Another deploy command in the same Bash call (for example `deploy resume`) can change that cache, so the guard blocks quick or cancel together with another deploy command. Run them as separate Bash commands. It reads short-flag clusters the way sf does (`-rw` = `-r -w`).
 
 The guard also blocks these cases:
 
@@ -142,7 +142,7 @@ bash install.sh
 
 `install.sh` does these steps:
 
-1. Copies `guard/` to `~/.local/share/ka-vault/hooks/`. It stages the new files, tests them, and then replaces the installed files one at a time with an atomic rename. If a step fails, the old guard stays in place and keeps blocking.
+1. Copies `guard/` to `~/.local/share/ka-vault/hooks/`. It stages the new files, tests them, and then replaces the installed files one at a time with an atomic rename. If the copy or the test fails, the old guard stays in place and keeps blocking. If a rename fails partway, the installed files can be from two versions: run install.sh again.
 2. Removes old guard registrations from `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json` when that variable is set), adds one correct registration, and verifies the result. It stops with an error if `disableAllHooks` is `true`.
 3. Runs a self-test with the registered command. A deploy with no target must give exit 2, and `git status` must give exit 0.
 4. Removes the admin override file from older versions.
@@ -156,7 +156,7 @@ Restart open Claude Code sessions after you install.
 ### Requirements
 
 - Claude Code with `PreToolUse` hook support.
-- Node.js 18 or later. The `sf` CLI needs it too. The hook looks on `PATH`, then in `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, Volta, the sf installer folders, and nvm. If it finds no Node.js, it blocks every Bash command that mentions Salesforce.
+- Node.js 18 or later. The `sf` CLI needs it too. The hook looks on `PATH`, then in `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, Volta, the sf installer folders, nvm, and the folder of the `sf` binary. If it finds no Node.js, it blocks every Bash command that mentions `sf` or Salesforce, uses ANSI-C quoting (`$'...'`), or has an expansion where a command name can be. This fallback is a simple text check, not a parser. Install Node.js to get the full guard.
 - The Salesforce CLI (`sf`). The hook looks on `PATH`, then in the usual install folders and nvm.
 - `jq`, for `install.sh` only. The hook does not need `jq`.
 

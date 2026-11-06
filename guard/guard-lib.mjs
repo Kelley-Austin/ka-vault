@@ -140,8 +140,15 @@ class Parser {
       if (c === '(' && word && !word.quoted) {
         if (/^[A-Za-z_][A-Za-z0-9_]*\+?=$/.test(word.v)) {
           // Array assignment a=(x y z): data. Only substitutions inside it run.
+          // Read the elements as words, so that single quotes keep text literal.
           const inner = this.readBalanced();
-          new Parser(inner, this.out).readDoubleBody(newWord(), false);
+          const ep = new Parser(inner, this.out);
+          while (ep.i < ep.s.length) {
+            const ch = ep.s[ep.i];
+            if (ch === ' ' || ch === '\t' || ch === '\n') { ep.i++; continue; }
+            if (ch === '#') { while (ep.i < ep.s.length && ep.s[ep.i] !== '\n') ep.i++; continue; }
+            if (!ep.readWord()) ep.i++; // a metacharacter in an element: skip it
+          }
           word.v += '(…)';
           continue;
         }
@@ -186,6 +193,14 @@ class Parser {
       const c = this.s[j];
       if (c === '\\') { j++; continue; }
       if (c === "'") { const e = this.s.indexOf("'", j + 1); if (e < 0) break; j = e; continue; }
+      if (c === '"') {
+        // Parentheses in double quotes do not count. Skip to the closing quote.
+        let e = j + 1;
+        while (e < this.s.length && this.s[e] !== '"') e += this.s[e] === '\\' ? 2 : 1;
+        if (e >= this.s.length) break;
+        j = e;
+        continue;
+      }
       if (c === '(') depth++;
       else if (c === ')' && --depth === 0) { this.i = j + 1; return this.s.slice(start, j); }
     }
@@ -285,8 +300,16 @@ class Parser {
       return;
     }
     if (c === '"') { this.i++; this.readDoubleBody(w, true); w.quoted = true; return; }
-    if (c === '$') { this.readDollar(w, false); return; }
-    if (c === '`') { this.readBacktick(w); return; }
+    if (c === '$') {
+      // An unquoted expansion can split into more words (w.split).
+      const had = w.exp;
+      w.exp = false;
+      this.readDollar(w, false);
+      if (w.exp) w.split = true;
+      w.exp = w.exp || had;
+      return;
+    }
+    if (c === '`') { this.readBacktick(w); w.split = true; return; }
     if (c === '*' || c === '?' || c === '[') w.glob = true;
     if (c === '{') w.brace = true;
     w.v += c;
@@ -601,6 +624,9 @@ function findSf(ws, ctx, via0) {
   const nest = (text) => ctx.nested.push({ text, via: { ...via } });
   const budget = { n: 0, over: false };
   const splitEnv = (text, after) => {
+    // GNU env -S has its own escapes (\_ is a space, \c, ${VAR}) that Bash
+    // syntax does not have. The guard cannot read them. Treat them as opaque.
+    if (/[\\$]/.test(text)) { ctx.opaque.push({ name: 'env -S', sfArgs: true }); return null; }
     let words;
     try { words = parseScript(text)[0] ?? []; } catch { nest(text); return null; }
     return findSf([...words, ...after], ctx, via);
@@ -659,13 +685,17 @@ function findSf(ws, ctx, via0) {
         let j = k + 1;
         while (j < ws.length && ws[j].v.startsWith('-')) {
           const v = ws[j].v;
-          if (v === '--command' || (/^-[A-Za-z]+$/.test(v) && v.includes('c'))) {
-            const at = v.indexOf('c');
-            nest(v.startsWith('--') || at === v.length - 1 ? (ws[j + 1]?.v ?? '') : v.slice(at + 1));
-            return null;
-          }
+          if (v === '--command') { nest(ws[j + 1]?.v ?? ''); return null; }
           if (v.startsWith('--command=')) { nest(v.slice(10)); return null; }
-          j += (v === '-t' || v === '-F' || v === '-T') ? 2 : 1;
+          if (v.startsWith('--')) { j++; continue; }
+          // Short option cluster. -c takes the rest of the word or the next word
+          // (-qc'CMD', -qc CMD). Options with a value end the cluster.
+          let step = 1;
+          for (let x = 1; x < v.length; x++) {
+            if (v[x] === 'c') { nest(v.slice(x + 1) || (ws[j + 1]?.v ?? '')); return null; }
+            if ('tTEIOBmo'.includes(v[x])) { if (x === v.length - 1) step = 2; break; }
+          }
+          j += step;
         }
         k = j + 1; // skip the typescript file; the rest is the command
         continue;
@@ -779,6 +809,30 @@ function findSf(ws, ctx, via0) {
       case 'eval':
         nest(ws.slice(k + 1).map((x) => x.v).join(' '));
         return null;
+      case 'awk': case 'gawk': case 'mawk': case 'nawk': {
+        // awk can run commands: system(), getline from a command, print | "cmd".
+        const text = ws.slice(k + 1).map((x) => x.v).join(' ');
+        if (/\bsystem\s*\(|\bgetline\b|\|&|\bprintf?\b[^;}\n]*\|/.test(text)) ctx.foreign.push({ name: base, text });
+        return null;
+      }
+      case 'sed': case 'gsed': {
+        // GNU sed runs commands with the "e" command and the s///e flag.
+        const text = ws.slice(k + 1).map((x) => x.v).join('\n');
+        if (/(^|[;{}\n]|[0-9$\/])\s*e\b|\/[gpiImM0-9w]*e[gpiImM0-9]*\s*($|[;}\n])/.test(text)) ctx.foreign.push({ name: base, text });
+        return null;
+      }
+      case 'git': {
+        // git -c alias.x='!cmd', core.pager, core.sshCommand, and others run commands.
+        for (let j = k + 1; j < ws.length; j++) {
+          const v = ws[j].v;
+          if (v === '-c' || v === '--config-env') { if (ws[j + 1]) ctx.foreign.push({ name: 'git -c', text: ws[j + 1].v }); j++; continue; }
+          if (v.startsWith('-c') && v.length > 2) { ctx.foreign.push({ name: 'git -c', text: v.slice(2) }); continue; }
+          if (v.startsWith('--config-env=')) { ctx.foreign.push({ name: 'git -c', text: v.slice(13) }); continue; }
+          if (['-C', '--git-dir', '--work-tree', '--namespace', '--exec-path'].includes(v)) { j++; continue; }
+          if (!v.startsWith('-')) break; // the git subcommand: the rest is its arguments
+        }
+        return null;
+      }
       case 'find': {
         for (let j = k + 1; j < ws.length; j++) {
           if (['-exec', '-execdir', '-ok', '-okdir'].includes(ws[j].v)) {
@@ -887,6 +941,12 @@ function parseSfArgv(argv, flags) {
   const bools = new Set();
   const problems = [];
   const add = (name, w) => values.set(name, [...(values.get(name) ?? []), w]);
+  // A separate value word with an unquoted expansion can split into more
+  // words, for example --wait ${W:-5 --use-most-recent}. Block it.
+  const takeValue = (flag, name, w) => {
+    if (w.split) problems.push(`the value of ${flag} contains an unquoted shell expansion that can split into more arguments`);
+    add(name, w);
+  };
   for (let i = 0; i < argv.length; i++) {
     const w = argv[i];
     const v = w.v;
@@ -904,7 +964,7 @@ function parseSfArgv(argv, flags) {
       if (isBool) { bools.add(name); continue; }
       if (eq > 0) { add(name, { v: v.slice(eq + 1), exp: false }); continue; }
       if (i + 1 >= argv.length) { problems.push(`the flag ${key} has no value`); continue; }
-      add(name, argv[++i]);
+      takeValue(key, name, argv[++i]);
       continue;
     }
     if (v.startsWith('-') && v.length > 1) {
@@ -916,7 +976,7 @@ function parseSfArgv(argv, flags) {
         if (isBool) { bools.add(name); continue; }
         const rest = v.slice(j + 1).replace(/^=/, '');
         if (rest) add(name, { v: rest, exp: false });
-        else if (i + 1 < argv.length) add(name, argv[++i]);
+        else if (i + 1 < argv.length) takeValue(`-${v[j]}`, name, argv[++i]);
         else problems.push(`the flag -${v[j]} has no value`);
         break;
       }
@@ -1015,7 +1075,29 @@ function needTargets(id, targets, flagName, known) {
   return { kind: 'check', id, targets: uniq };
 }
 
-export function analyzeSf(argv, table) {
+// The sf CLI (dist/flags.js preprocessCliFlags) removes --dev-debug, and the
+// first --debug-filter with the word after it, before oclif reads argv.
+// Do the same, so that "--debug-filter -h" is not read as a help request.
+function preprocessCliFlags(argv) {
+  const a = [...argv];
+  let unsafe = false;
+  a.map((w) => {
+    if (w.v === '--dev-debug') {
+      const fi = a.findIndex((x) => x.v === '--debug-filter');
+      if (fi >= 0) {
+        if (a[fi + 1]?.split) unsafe = true;
+        a.splice(fi, 2);
+      }
+      a.splice(a.findIndex((x) => x.v === '--dev-debug'), 1);
+    }
+  });
+  return { argv: a, unsafe };
+}
+
+export function analyzeSf(argv0, table) {
+  const pre = preprocessCliFlags(argv0);
+  if (pre.unsafe) return block('The value of --debug-filter contains an unquoted shell expansion. Write it literally.');
+  const argv = pre.argv;
   const dd = argv.findIndex((w) => w.v === '--');
   const flagPart = dd < 0 ? argv : argv.slice(0, dd);
   if (flagPart.some((w) => !w.exp && (w.v === '--help' || w.v === '-h'))) return { kind: 'allow', help: true };
@@ -1086,6 +1168,9 @@ export function analyzeSf(argv, table) {
     const j = literalValues(p.values.get('job-id'), '--job-id');
     if (j.error) return block(`"${pretty(id)}": ${j.error}`);
     targets = [...cacheOrgTargets(j.values, p.bools.has('use-most-recent')), ...targets];
+    const r = needTargets(id, targets, '--target-org', true);
+    if (r.kind === 'check') r.usesCache = true;
+    return r;
   } else if (new Set(targets).size > 1) {
     return block(`"${pretty(id)}" names more than one org (${[...new Set(targets)].join(', ')}). Give exactly one --target-org.`);
   }
@@ -1104,7 +1189,9 @@ export function analyze(command, table) {
       queue.push(...parseScript(text).map((ws) => ({ ws, via })));
     } catch (e) {
       if (!(e instanceof ParseError)) throw e;
-      if (looksSalesforce(text)) results.push(block(`The guard cannot parse the command (${e.message}). Fix the shell syntax, or run the sf command as a separate, simple command.`));
+      // The raw text can hide an sf call in an expansion or in $'\x73\x66'.
+      // After a parse failure, block those too.
+      if (looksSalesforce(text) || /[$`]/.test(text)) results.push(block(`The guard cannot parse the command (${e.message}). Fix the shell syntax, or run the sf command as a separate, simple command.`));
     }
   };
   parseInto(command, {});
@@ -1143,6 +1230,16 @@ export function analyze(command, table) {
     }
   }
   const checks = results.filter((r) => r.kind === 'check');
+  // deploy quick / cancel read their org from the deploy cache. Another
+  // deploy command in the same call (start, validate, resume, report) can
+  // change that cache after the guard reads it.
+  const sfResults = results.filter((r) => r.kind !== 'block');
+  if (checks.some((r) => r.usesCache) && sfResults.some((r) => !r.usesCache && /^project:deploy:/.test(r.id ?? ''))) {
+    results.push(block('The command runs "sf project deploy quick" or "cancel" together with another deploy command. The other command can change the deploy cache that quick and cancel read their org from. Run quick or cancel as a separate Bash command.'));
+  }
+  if (checks.filter((r) => r.usesCache).length > 1) {
+    results.push(block('The command runs more than one "sf project deploy quick" or "cancel". Each one can change the deploy cache. Run them as separate Bash commands.'));
+  }
   if (checks.length) {
     if (results.some((r) => r.mutatesState)) {
       results.push(block('The command changes an org alias, login, or sf config, and also runs a command that changes an org. Run the alias, login, or config change as a separate Bash command first.'));

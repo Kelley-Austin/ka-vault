@@ -214,6 +214,17 @@ const bypasses = {
   'extended glob in the command name': `bash -O extglob -c '/opt/homebrew/bin/@(sf|sfdx) project deploy start -o prod'`,
   'NUL in ANSI-C command name': `$'sf\\0ignored' project deploy start -o prod`,
   'wrapper chain longer than the limit': `${'env '.repeat(70)}${D} -o prod`,
+  // Fifth Codex review
+  'debug filter value read as help': 'sf --dev-debug --debug-filter -h project deploy start -o prod',
+  'debug filter value hides the command': `sf --dev-debug --debug-filter '*' org delete sandbox -o sbx --no-prompt`,
+  'expansion in a flag value adds a cache selector': `sf project deploy quick -o sbx --wait \${WAIT:-5 --use-most-recent}`,
+  'resume changes the cache before quick --use-most-recent': 'sf project deploy resume --job-id 0Af000000000001AAA && sf project deploy quick --use-most-recent -o sbx',
+  'awk system()': `awk 'BEGIN {system("${D} -o prod")}'`,
+  'GNU sed e command': `sed -n '1e ${D} -o prod' README.md`,
+  'git -c shell alias': `git -c alias.deploy='!${D} -o prod' deploy`,
+  'env -S with GNU escapes': `env -S 'sf\\_project\\_deploy\\_start\\_-o\\_prod'`,
+  'script -c with an attached value': `script -qc'${D} -o prod' /dev/null`,
+  'quoted parenthesis in an array, then an ANSI-C command name': `a=("("); $'\\x73\\x66' project deploy start -o prod`,
 };
 for (const [name, command] of Object.entries(bypasses)) {
   test(`blocks: ${name}`, () => { expectBlock(command); });
@@ -334,6 +345,14 @@ test('blocks: sf CLI not found', () => {
   if (['/opt/homebrew/bin/sf', '/usr/local/bin/sf'].some(existsSync)) return;
   expectBlock(`${D} -o sbx`, { pathDirs: [NODE_DIR, '/usr/bin', '/bin'] });
 });
+test('no Node.js: blocks hidden command names, allows argument expansions', (t) => {
+  if (['/opt/homebrew/bin/node', '/usr/local/bin/node', '/usr/bin/node', '/bin/node'].some(existsSync)) { t.skip('a system node exists at a fallback path'); return; }
+  const p = { pathDirs: ['/usr/bin', '/bin'] };
+  expectBlock('"$CLI" project deploy start -o prod', p);
+  expectBlock(`$'\\x73\\x66' project deploy start -o prod`, p);
+  expectBlock('X=1 $CLI project deploy start -o prod', p);
+  expectAllow('echo "$HOME"; ls $TMPDIR', p);
+});
 test('no Node.js: blocks Salesforce commands, allows other commands', (t) => {
   if (['/opt/homebrew/bin/node', '/usr/local/bin/node', '/usr/bin/node', '/bin/node'].some(existsSync)) { t.skip('a system node exists at a fallback path'); return; }
   expectBlock(`${D} -o sbx`, { pathDirs: ['/usr/bin', '/bin'] });
@@ -397,6 +416,12 @@ const noQuery = {
   'guard table generator': 'node guard/gen-sf-command-table.mjs',
   'array assignment is data': `cmd=(${D} -o prod); printf '%q ' "\${cmd[@]}"`,
   'extended glob that does not match sf': `bash -O extglob -c 'ls @(a|b).txt'`,
+  'single-quoted substitution in an array is data': `examples=('$(${D} -o prod)'); printf '%s\\n' "\${examples[@]}"`,
+  'sed substitution that mentions sf': `sed -i '' 's/sf project deploy start/sf project deploy validate/' README.md`,
+  'awk filter that mentions sf': `awk '/sf project deploy/ {print $1}' notes.txt`,
+  'git -c with a commit message that mentions sf': `git -c user.name=ci commit -m "${D} -o prod"`,
+  'dev-debug on a read-only command': 'sf --dev-debug --debug-filter sf:* org list',
+  'quick deploy alone': 'sf project deploy report --job-id 0Af000000000002AAA',
   'arithmetic with a command substitution': 'start=$(date +%s); bash guard/block-sf-prod-deploy.sh < in.json; echo "took $(( $(date +%s) - start ))s"',
 };
 for (const [name, command] of Object.entries(noQuery)) {
