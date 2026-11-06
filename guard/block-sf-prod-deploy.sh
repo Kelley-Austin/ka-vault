@@ -57,7 +57,14 @@ if [ -z "$NODE" ]; then
   fi
   [ -z "$CMD_TEXT" ] && CMD_TEXT="$INPUT"
   shopt -s nocasematch
-  STRIPPED="${CMD_TEXT//[\'\"\\]/}"
+  # Remove quotes and backslashes with tr. The Bash 3.2 form ${CMD_TEXT//[...]/}
+  # takes more than 60 s on 16 KB, and Claude Code does not block when a hook
+  # runs past its timeout. LC_ALL=C: tr must not stop on bytes that are not UTF-8.
+  # If tr fails, STRIPPED is empty and the checks below see nothing. Block.
+  if ! STRIPPED="$(printf '%s' "$CMD_TEXT" | LC_ALL=C tr -d "'\"\\\\")"; then
+    echo "ka-vault guard: BLOCKED. Node.js is not available to the hook, and the fallback check failed (tr). Install Node.js (the sf CLI needs it too), then restart Claude Code." >&2
+    exit 2
+  fi
   # Also block text that can hide an sf call: ANSI-C quoting ($'\x73\x66'),
   # and a command name that contains an expansion, a backtick, a brace, or a
   # glob anywhere in it (s${X:-f}, s{f..f}, s?, /bin/s[f], [[:lower:]]f).

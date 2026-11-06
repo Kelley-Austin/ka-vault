@@ -384,6 +384,21 @@ test('no Node.js: blocks hidden command names, allows argument expansions', (t) 
   // A wrapper skips only its options and option values, not the command name.
   expectAllow('env echo "$HOME"; command ls *.txt; sudo -u root ls $TMPDIR; nice -n 5 cat a{1,2}.txt', p);
 });
+test('no Node.js: blocks when tr fails', (t) => {
+  if (['/opt/homebrew/bin/node', '/usr/local/bin/node', '/usr/bin/node', '/bin/node'].some(existsSync)) { t.skip('a system node exists at a fallback path'); return; }
+  const bad = path.join(DIR, 'bad-tr');
+  mkdirSync(bad, { recursive: true });
+  writeFileSync(path.join(bad, 'tr'), '#!/bin/sh\nexit 1\n');
+  chmodSync(path.join(bad, 'tr'), 0o755);
+  expectBlock(`${D} -o prod`, { pathDirs: [bad, '/usr/bin', '/bin'] });
+});
+test('no Node.js: a 300 KB padded command gets a decision in time', (t) => {
+  if (['/opt/homebrew/bin/node', '/usr/local/bin/node', '/usr/bin/node', '/bin/node'].some(existsSync)) { t.skip('a system node exists at a fallback path'); return; }
+  // Claude Code does not block when a hook runs past its 60 s timeout.
+  const started = Date.now();
+  expectBlock(`X="${'a '.repeat(150000)}" ${D} -o prod`, { pathDirs: ['/usr/bin', '/bin'] });
+  assert.ok(Date.now() - started < 10000, `took ${Date.now() - started} ms`);
+});
 test('no Node.js: blocks Salesforce commands, allows other commands', (t) => {
   if (['/opt/homebrew/bin/node', '/usr/local/bin/node', '/usr/bin/node', '/bin/node'].some(existsSync)) { t.skip('a system node exists at a fallback path'); return; }
   expectBlock(`${D} -o sbx`, { pathDirs: ['/usr/bin', '/bin'] });
