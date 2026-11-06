@@ -1,10 +1,9 @@
 # ka-vault
 
-ka-vault is the Kelley Austin toolkit for Salesforce work with Claude Code. It contains:
+ka-vault is the Kelley Austin toolkit for Salesforce work with Claude Code. It contains two tools:
 
 - **`sf-prod-guard`**, a Claude Code plugin that **blocks every Salesforce CLI command that can change a production org**. There are no exceptions and no override.
 - **`cheese-backup-then-modify`**, a helper that saves the current org metadata to a git branch before you change it.
-- A Salesforce DX project skeleton (`force-app/`, `manifest/`, `sfdx-project.json`).
 
 The guard allows writes to these orgs:
 
@@ -453,7 +452,6 @@ managed/managed-settings.json       # policy that makes the plugin mandatory (Op
 bin/cheese-backup-then-modify       # backup helper
 tests/guard.test.mjs                # end-to-end tests with a fake sf (no org access)
 install.sh                          # installs the plugin, removes the old hook, installs the helper
-force-app/, manifest/, sfdx-project.json   # Salesforce DX project skeleton (API version 62.0)
 ```
 
 `.claude/settings.json` adds the `ka-vault` marketplace and enables `sf-prod-guard@ka-vault` for sessions in this repo. Claude Code applies it after you trust the folder. So a teammate who opens this repo gets the guard in this repo even before they run `install.sh`. Only the user install (Option A or B) or managed settings (Option C) protect their other projects.
