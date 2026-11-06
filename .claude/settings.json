@@ -1,17 +1,15 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/bin/bash \"$CLAUDE_PROJECT_DIR/guard/block-sf-prod-deploy.sh\"",
-            "timeout": 60
-          }
-        ]
-      }
-    ]
+  "extraKnownMarketplaces": {
+    "ka-vault": {
+      "source": {
+        "source": "github",
+        "repo": "Kelley-Austin/ka-vault"
+      },
+      "autoUpdate": true
+    }
+  },
+  "enabledPlugins": {
+    "sf-prod-guard@ka-vault": true
   }
 }

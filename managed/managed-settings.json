@@ -1,0 +1,14 @@
+{
+  "extraKnownMarketplaces": {
+    "ka-vault": {
+      "source": {
+        "source": "github",
+        "repo": "Kelley-Austin/ka-vault"
+      },
+      "autoUpdate": true
+    }
+  },
+  "enabledPlugins": {
+    "sf-prod-guard@ka-vault": true
+  }
+}

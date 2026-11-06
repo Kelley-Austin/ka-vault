@@ -9,7 +9,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync, chmodS
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { READ_ONLY, ALWAYS_BLOCK, loadCommandTable, classify } from '../guard/guard-lib.mjs';
+import { READ_ONLY, ALWAYS_BLOCK, loadCommandTable, classify } from '../plugins/sf-prod-guard/guard/guard-lib.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const NODE_DIR = path.dirname(process.execPath);
@@ -55,7 +55,7 @@ function setup() {
     '0Af000000000002AAA': { 'target-org': 'sbx', timestamp: '2026-11-02T10:00:00.000Z' },
   }));
   // Run a copy of the guard, so the test allowlist does not touch the real one.
-  cpSync(path.join(ROOT, 'guard'), path.join(dir, 'guard'), { recursive: true });
+  cpSync(path.join(ROOT, 'plugins', 'sf-prod-guard', 'guard'), path.join(dir, 'guard'), { recursive: true });
   writeFileSync(path.join(dir, 'guard', 'allowed-orgs.json'), JSON.stringify({ orgs: [
     { orgId: ORGS.sdo.Id, label: 'Test SDO', kind: 'SDO', owner: 'tests', expires: '2099-12-31' },
     { orgId: ORGS.oldsdo.Id.slice(0, 15), label: 'Old SDO', kind: 'SDO', owner: 'tests', expires: '2020-01-01' },
@@ -487,7 +487,7 @@ for (const [name, command] of Object.entries(noQuery)) {
 // ── Unit checks ──────────────────────────────────────────────────────────────
 
 test('every READ_ONLY and ALWAYS_BLOCK id exists in the command table', () => {
-  const table = loadCommandTable(path.join(ROOT, 'guard', 'sf-command-table.json'));
+  const table = loadCommandTable(path.join(ROOT, 'plugins', 'sf-prod-guard', 'guard', 'sf-command-table.json'));
   const ids = new Set([...table.values()].map((e) => e.id));
   assert.deepEqual([...READ_ONLY, ...ALWAYS_BLOCK.keys()].filter((i) => !ids.has(i)), []);
 });
@@ -496,5 +496,53 @@ test('classify: production editions are never allowed', () => {
   const none = { entries: [], problems: [] };
   for (const type of ['Enterprise Edition', 'Unlimited Edition', 'Professional Edition', 'Performance Edition', 'Personal Edition', 'Team Edition', 'Base Edition']) {
     assert.equal(classify({ Id: '00D000000000009AAA', IsSandbox: false, OrganizationType: type, TrialExpirationDate: null }, none).ok, false, type);
+  }
+});
+
+// ── Plugin packaging ─────────────────────────────────────────────────────────
+
+const PLUGIN_DIR = path.join(ROOT, 'plugins', 'sf-prod-guard');
+const readJson = (...p) => JSON.parse(readFileSync(path.join(...p), 'utf8'));
+
+test('plugin: the marketplace lists sf-prod-guard at its folder', () => {
+  const m = readJson(ROOT, '.claude-plugin', 'marketplace.json');
+  assert.equal(m.name, 'ka-vault');
+  const entry = m.plugins.find((p) => p.name === 'sf-prod-guard');
+  assert.ok(entry, 'no sf-prod-guard entry');
+  assert.equal(path.resolve(ROOT, entry.source), PLUGIN_DIR);
+});
+
+test('plugin: plugin.json has no version, so each commit ships as an update', () => {
+  const p = readJson(PLUGIN_DIR, '.claude-plugin', 'plugin.json');
+  assert.equal(p.name, 'sf-prod-guard');
+  assert.equal(p.version, undefined, 'a version field keeps users on an old guard until someone bumps it');
+});
+
+test('plugin: hooks.json registers the wrapper for Bash, fails closed, and blocks a deploy', () => {
+  const h = readJson(PLUGIN_DIR, 'hooks', 'hooks.json');
+  const groups = h.hooks.PreToolUse.filter((g) => g.matcher === 'Bash');
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].hooks.length, 1);
+  const hook = groups[0].hooks[0];
+  assert.equal(hook.type, 'command');
+  assert.equal(hook.onFailure, 'block');
+  assert.ok(hook.timeout >= 55 && hook.timeout <= 60, 'the wrapper deadline (50 s) must end before the hook timeout');
+  // Run the registered command the way Claude Code does, against the test copy.
+  const cmd = hook.command.replaceAll('${CLAUDE_PLUGIN_ROOT}', DIR);
+  assert.ok(cmd.includes(path.join(DIR, 'guard', 'block-sf-prod-deploy.sh')), cmd);
+  const env = { PATH: [path.join(DIR, 'bin'), NODE_DIR, '/usr/bin', '/bin'].join(':'), HOME: path.join(DIR, 'home'), FAKE_SF_ORGS: path.join(DIR, 'orgs.json'), FAKE_SF_LOG: path.join(DIR, 'sf.log') };
+  const deploy = spawnSync('/bin/sh', ['-c', cmd], { input: JSON.stringify({ tool_input: { command: 'sf project deploy start' } }), encoding: 'utf8', env });
+  assert.equal(deploy.status, 2, deploy.stderr);
+  const safe = spawnSync('/bin/sh', ['-c', cmd], { input: JSON.stringify({ tool_input: { command: 'git status' } }), encoding: 'utf8', env });
+  assert.equal(safe.status, 0, safe.stderr);
+});
+
+test('plugin: project and managed settings enable the plugin from the GitHub marketplace', () => {
+  for (const file of [path.join(ROOT, '.claude', 'settings.json'), path.join(ROOT, 'managed', 'managed-settings.json')]) {
+    const s = JSON.parse(readFileSync(file, 'utf8'));
+    assert.equal(s.enabledPlugins?.['sf-prod-guard@ka-vault'], true, file);
+    assert.deepEqual(s.extraKnownMarketplaces?.['ka-vault']?.source, { source: 'github', repo: 'Kelley-Austin/ka-vault' }, file);
+    // A direct hook registration as well would run the guard twice.
+    assert.equal(JSON.stringify(s.hooks ?? {}).includes('block-sf-prod-deploy'), false, file);
   }
 });
