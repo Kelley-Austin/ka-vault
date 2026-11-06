@@ -1,0 +1,4 @@
+{
+  "_readme": "Demo orgs (IDO, SDO) that the guard cannot classify from live data. Key by the 15- or 18-character Org ID (SELECT Id FROM Organization), never by alias. Add entries by pull request. Each entry needs orgId, label, kind, owner, and expires (YYYY-MM-DD). The guard ignores expired entries.",
+  "orgs": []
+}
