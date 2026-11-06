@@ -165,9 +165,13 @@ class Parser {
       if (c === ' ' || c === '\t') { endWord(); this.i++; continue; }
       if (c === '\n') { endCmd(); this.i++; this.readHeredocBodies(); continue; }
       if (c === '<' || c === '>' || (c === '&' && n === '>')) {
-        if (word && !word.quoted && !word.exp && /^\d+$/.test(word.v)) word = null; // fd number, e.g. 2>
+        // fd: the file descriptor that the redirection changes. null = the
+        // default (0 for input). -1 = a {var} redirection: Bash selects a new fd.
+        let fd = null;
+        if (word && !word.quoted && !word.exp && /^\d+$/.test(word.v)) { fd = Number(word.v); word = null; } // e.g. 2>
+        else if (word && !word.quoted && !word.exp && /^\{[A-Za-z_][A-Za-z0-9_]*\}$/.test(word.v)) { fd = -1; word = null; } // {v}<<<
         else endWord();
-        this.readRedirect(words);
+        this.readRedirect(words, fd);
         continue;
       }
       if (c === ';' || c === '&' || c === '|') { endCmd(); this.i++; continue; }
@@ -207,19 +211,30 @@ class Parser {
     throw new ParseError('a "(" has no matching ")"');
   }
 
-  readRedirect(owner) {
+  // Every heredoc or here-string body goes to owner.inputTexts. Only a body
+  // on fd 0 is also owner.stdinText. On another fd (3<<< text, {v}<<EOF) it
+  // is data, and stdin stays the pipe or terminal, unless a later 0<&3 makes
+  // it stdin. So another input redirection of fd 0 (< file, 0<&3) sets
+  // owner.stdinOther: stdin is then not known. Bash applies redirections left
+  // to right, so a later fd 0 heredoc or here-string clears stdinOther.
+  readRedirect(owner, fd = null) {
     const ops = ['&>>', '&>', '<<<', '<<-', '<<', '<>', '<&', '>>', '>|', '>&', '<', '>'];
     const op = ops.find((o) => this.s.startsWith(o, this.i));
     this.i += op.length;
+    const toStdin = fd === null || fd === 0;
     if (op === '<<' || op === '<<-') {
       const d = this.readDelimiter();
       if (!d) throw new ParseError('a heredoc has no delimiter');
-      this.heredocs.push({ delim: d.v, strip: op === '<<-', expand: !d.quoted, owner });
+      this.heredocs.push({ delim: d.v, strip: op === '<<-', expand: !d.quoted, owner, toStdin });
+      if (toStdin) owner.stdinOther = false;
       return;
     }
     const target = this.readWord();
     if (op === '<<<' && target) {
-      owner.stdinText = (owner.stdinText ?? '') + target.v + '\n';
+      (owner.inputTexts ??= []).push(target.v + '\n');
+      if (toStdin) { owner.stdinText = (owner.stdinText ?? '') + target.v + '\n'; owner.stdinOther = false; }
+    } else if (toStdin && (op === '<' || op === '<>' || op === '<&')) {
+      owner.stdinOther = true;
     }
   }
 
@@ -472,7 +487,10 @@ class Parser {
         if ((h.strip ? line.replace(/^\t+/, '') : line) === h.delim) break;
         body += line + '\n';
       }
-      if (h.owner) h.owner.stdinText = (h.owner.stdinText ?? '') + body;
+      if (h.owner) {
+        (h.owner.inputTexts ??= []).push(body);
+        if (h.toStdin) h.owner.stdinText = (h.owner.stdinText ?? '') + body;
+      }
       // A quoted delimiter makes the body plain data. An unquoted delimiter
       // makes $(...) and `...` in the body run.
       if (h.expand) new Parser(body, this.out).readDoubleBody(newWord(), false);
@@ -504,36 +522,94 @@ const INTERPRETERS = {
 };
 const SSH_ARG_OPTS = ['-b', '-c', '-D', '-E', '-e', '-F', '-I', '-i', '-J', '-L', '-l', '-m', '-O', '-o', '-p', '-Q', '-R', '-S', '-W', '-w'];
 
-// Brace expansion of one unquoted word: "{sf,x}" -> ["sf", "x"]. The budget
-// bounds the total work, so "{a,b}{a,b}..." cannot take exponential time.
+// One brace group: a list {a,b} or a sequence {f..g}, {1..9}, {a..z..2}.
+// Bash and zsh expand a sequence only when both ends are integers or both
+// are single letters, so other forms ({a..1}) stay literal and do not match.
+const BRACE_GROUP = /\{([^{}]*,[^{}]*)\}|\{(?:(-?\d+)\.\.(-?\d+)|([A-Za-z])\.\.([A-Za-z]))(?:\.\.(-?\d+))?\}/;
+
+function* braceItems(m) {
+  if (m[1] !== undefined) { yield* m[1].split(','); return; }
+  const isNum = m[2] !== undefined;
+  const from = isNum ? Number(m[2]) : m[4].charCodeAt(0);
+  const to = isNum ? Number(m[3]) : m[5].charCodeAt(0);
+  const inc = Math.abs(Number(m[6] ?? 1)) || 1;
+  const dir = from <= to ? 1 : -1;
+  for (let x = from; dir > 0 ? x <= to : x >= to; x += dir * inc) {
+    yield isNum ? String(x) : String.fromCharCode(x);
+  }
+}
+
+// Brace expansion of one unquoted word: "{sf,x}" -> ["sf", "x"],
+// "s{e..g}" -> ["se", "sf", "sg"]. The budget bounds the total work, so
+// "{a,b}{a,b}..." or "{1..1000000}" cannot take a long time.
 function expandBraces(s, budget) {
   if (budget.n >= 256) { budget.over = true; return []; }
-  const m = /\{([^{}]*,[^{}]*)\}/.exec(s);
+  const m = BRACE_GROUP.exec(s);
   if (!m) { budget.n++; return [s]; }
   const out = [];
-  for (const alt of m[1].split(',')) {
+  for (const alt of braceItems(m)) {
     if (budget.over) break;
     out.push(...expandBraces(s.slice(0, m.index) + alt + s.slice(m.index + m[0].length), budget));
   }
   return out;
 }
 
-// Does a glob such as "s[f]" or "s?" match sf or sfdx?
+// POSIX character classes in a glob bracket expression, as JavaScript class text.
+const POSIX_CLASSES = {
+  alpha: 'A-Za-z', digit: '0-9', alnum: 'A-Za-z0-9', lower: 'a-z', upper: 'A-Z', xdigit: '0-9A-Fa-f',
+  space: ' \\t\\n\\r\\f\\v', blank: ' \\t', punct: '!-\\/:-@\\[-`{-~', cntrl: '\\x00-\\x1f\\x7f',
+  print: ' -~', graph: '!-~', word: 'A-Za-z0-9_',
+};
+class UnreadableGlob extends Error {}
+
+// Read the bracket expression that starts at b[i] === "[". Return
+// { src: JavaScript class text, end: index of the closing "]" }, or null when
+// no "]" closes it (then "[" is a literal character).
+function readBracket(b, i) {
+  let j = i + 1;
+  let src = '';
+  if (b[j] === '!' || b[j] === '^') { src = '^'; j++; }
+  for (let first = true; j < b.length; first = false) {
+    const c = b[j];
+    if (c === ']' && !first) return { src: `[${src}]`, end: j };
+    if (c === '[' && b[j + 1] === ':') {
+      const e = b.indexOf(':]', j + 2);
+      if (e < 0) throw new UnreadableGlob();
+      const cls = POSIX_CLASSES[b.slice(j + 2, e)];
+      if (cls === undefined) throw new UnreadableGlob();
+      src += cls;
+      j = e + 2;
+      continue;
+    }
+    if (c === '[' && (b[j + 1] === '.' || b[j + 1] === '=')) throw new UnreadableGlob(); // [.x.] and [=x=]
+    // The parser already removed one level of backslashes, so the guard cannot
+    // tell an escaped "\" (s[f\\]) from an escaped "]" (s[f\]). Fail closed.
+    if (c === '\\') throw new UnreadableGlob();
+    src += c === '-' ? '-' : c.replace(/[\\\]\[^]/g, '\\$&'); // "-" stays a range operator
+    j++;
+  }
+  return null;
+}
+
+// Does a glob such as "s[f]", "[[:lower:]]f", or "s?" match sf or sfdx?
 function globMatchesSf(b) {
   if (!/[*?[]/.test(b)) return false;
-  let re = '';
-  for (let i = 0; i < b.length; i++) {
-    const c = b[i];
-    if (c === '*') re += '.*';
-    else if (c === '?') re += '.';
-    else if (c === '[') {
-      const end = b.indexOf(']', i + 2);
-      if (end < 0) { re += '\\['; continue; }
-      re += '[' + b.slice(i + 1, end).replace(/^!/, '^').replace(/\\/g, '\\\\') + ']';
-      i = end;
-    } else re += c.replace(/[.+^${}()|\\]/g, '\\$&');
-  }
   try {
+    let re = '';
+    for (let i = 0; i < b.length; i++) {
+      const c = b[i];
+      if (c === '*') re += '.*';
+      else if (c === '?') re += '.';
+      else if (c === '[') {
+        // No "]" closes this "[", so it is a literal character, and a name that
+        // contains "[" is never sf. Stop here: scanning again from each later
+        // "[" takes quadratic time ("[[[[...", 24 000 characters: 30 s).
+        const br = readBracket(b, i);
+        if (!br) return false;
+        re += br.src;
+        i = br.end;
+      } else re += c.replace(/[.+^${}()|\\[\]]/g, '\\$&');
+    }
     const rx = new RegExp(`^${re}$`);
     return rx.test('sf') || rx.test('sfdx');
   } catch {
@@ -809,6 +885,15 @@ function findSf(ws, ctx, via0) {
       case 'eval':
         nest(ws.slice(k + 1).map((x) => x.v).join(' '));
         return null;
+      case 'trap': {
+        // trap [-lp] [--] [ACTION] SIGNAL...: ACTION is shell text that runs
+        // later, for example on EXIT. "trap - SIG" resets. Check any other action.
+        let j = k + 1;
+        while (j < ws.length && /^-[lp]+$/.test(ws[j].v)) j++;
+        if (ws[j]?.v === '--') j++;
+        if (j < ws.length && ws[j].v !== '-') nest(ws[j].v);
+        return null;
+      }
       case 'awk': case 'gawk': case 'mawk': case 'nawk': {
         // awk can run commands: system(), getline from a command, print | "cmd".
         const text = ws.slice(k + 1).map((x) => x.v).join(' ');
@@ -900,8 +985,12 @@ function shellRuns(ws, k, base, ctx, nest) {
   if (hasC) { if (j < ws.length) nest(ws[j].v); return; }
   if (j < ws.length && !fromStdin) return; // bash script.sh: the guard cannot see inside scripts.
   // The shell reads its script from stdin: a heredoc, a here-string, or a pipe.
-  if (ws.stdinText !== undefined) nest(ws.stdinText);
-  else ctx.foreign.push({ name: `${base} reading a script from a pipe`, text: ctx.command });
+  // A body on another fd becomes stdin after 0<&N, so check every body.
+  // When stdin is not plainly the fd 0 body, also treat stdin as unknown.
+  for (const text of ws.inputTexts ?? []) nest(text);
+  if (ws.stdinText === undefined || ws.stdinOther) {
+    ctx.foreign.push({ name: `${base} reading a script from a pipe`, text: ctx.command });
+  }
 }
 
 // ── sf command analysis ──────────────────────────────────────────────────────

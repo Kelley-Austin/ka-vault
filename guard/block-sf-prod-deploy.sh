@@ -59,12 +59,24 @@ if [ -z "$NODE" ]; then
   shopt -s nocasematch
   STRIPPED="${CMD_TEXT//[\'\"\\]/}"
   # Also block text that can hide an sf call: ANSI-C quoting ($'\x73\x66'),
-  # and an expansion or a backtick in the command-name position (at the start,
-  # or after ; & | ( { or a newline, after optional NAME=value words).
-  CMD_POS_EXPANSION=$'(^|[;&|({\n`])[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*["\']?(\\$|`)'
+  # and a command name that contains an expansion, a backtick, a brace, or a
+  # glob anywhere in it (s${X:-f}, s{f..f}, s?, /bin/s[f], [[:lower:]]f).
+  # The command name is the first word at the start, or after ; & | ( ` "{ "
+  # or a newline. Before it can come NAME=value words, keywords (if, then, do),
+  # and a wrapper (sudo, exec, env, timeout). The wrapper skips only its
+  # options, the value of a short option that takes one (-u root, -n 5),
+  # numbers (timeout 5), and NAME=value words, so that the command name after
+  # it is checked, not its arguments. A plain "[" or "[[" test is not a glob.
+  SEP=$'(^|[;&|(\n`]|\\{[[:space:]])[[:space:]]*'
+  ASSIGN=$'[A-Za-z_][A-Za-z0-9_]*=("[^"]*"|\'[^\']*\'|[^[:space:]])*'
+  LEAD="(($ASSIGN|then|else|elif|do|if|while|until|!)[[:space:]]+)*"
+  WRAP_ARG="(-[ugnskCpPDt][[:space:]]+[^-[:space:]][^[:space:]]*|-[^[:space:]]*|[0-9][0-9.]*[smhd]?|$ASSIGN)"
+  WRAP="((sudo|doas|exec|env|command|builtin|nohup|nice|time|timeout|gtimeout|xargs|stdbuf|caffeinate|watch)([[:space:]]+$WRAP_ARG)*[[:space:]]+)?"
+  NAME=$'[A-Za-z0-9_./~"\'\\-]*(\\$|`|[{?*]|\\[[^[:space:][]|\\[\\[[^[:space:]])'
+  CMD_NAME_HIDDEN="$SEP$LEAD$WRAP$NAME"
   if [[ "$STRIPPED" == *sf* || "$STRIPPED" == *salesforce* ]] \
      || [[ "$CMD_TEXT" == *"\$'"* ]] \
-     || [[ "$CMD_TEXT" =~ $CMD_POS_EXPANSION ]]; then
+     || [[ "$CMD_TEXT" =~ $CMD_NAME_HIDDEN ]]; then
     echo "ka-vault guard: BLOCKED. Node.js is not available to the hook, so the guard cannot check Salesforce commands. Install Node.js (the sf CLI needs it too), then restart Claude Code." >&2
     exit 2
   fi

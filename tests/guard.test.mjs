@@ -225,6 +225,19 @@ const bypasses = {
   'env -S with GNU escapes': `env -S 'sf\\_project\\_deploy\\_start\\_-o\\_prod'`,
   'script -c with an attached value': `script -qc'${D} -o prod' /dev/null`,
   'quoted parenthesis in an array, then an ANSI-C command name': `a=("("); $'\\x73\\x66' project deploy start -o prod`,
+  // Codex bug hunt, round 6
+  'trap action runs on EXIT': `trap '${D} -o prod' EXIT; exit`,
+  'trap with -- and several signals': `trap -- "${D} -o prod" INT TERM EXIT`,
+  'brace sequence in the command name': 's{f..f} project deploy start -o prod',
+  'brace sequence with a step in the command name': 's{f..f..1} project deploy start -o prod',
+  'POSIX class in a path glob': '/opt/sf/bin/[[:lower:]]f project deploy start -o prod',
+  'POSIX class in the command name': 's[[:alpha:]] project deploy start -o prod',
+  'here-string on fd 3, script from the pipe': `printf '%s\\n' '${D} -o prod' | bash 3<<< 'echo safe'`,
+  'heredoc on fd 3, script from the pipe': `printf '%s\\n' '${D} -o prod' | bash 3<<EOF\necho safe\nEOF`,
+  'here-string replaced by a later stdin redirection': `printf '%s\\n' '${D} -o prod' | bash 3<&0 <<< 'echo safe' 0<&3`,
+  'here-string on fd 3 duplicated to stdin': `bash 3<<< 's\${X:-f} project deploy start -o prod' 0<&3`,
+  'heredoc on fd 3 duplicated to stdin': `bash 3<<'EOF' 0<&3\ns\${X:-f} project deploy start -o prod\nEOF`,
+  'escaped backslash inside a glob bracket': '/opt/sf/bin/s[f\\\\] project deploy start -o prod',
 };
 for (const [name, command] of Object.entries(bypasses)) {
   test(`blocks: ${name}`, () => { expectBlock(command); });
@@ -298,6 +311,11 @@ test('blocks quickly: exponential brace expansion before a prod deploy', () => {
   expectBlock(`'${'{a,b}'.repeat(40)}'; {x,y}${'{a,b}'.repeat(30)}; ${D} -o prod`);
   assert.ok(Date.now() - t < 10_000, `took ${Date.now() - t} ms`);
 });
+test('blocks quickly: many unclosed glob brackets before a prod deploy', () => {
+  const t = Date.now();
+  expectBlock(`${'['.repeat(24000)}; ${D} -o prod`);
+  assert.ok(Date.now() - t < 10_000, `took ${Date.now() - t} ms`);
+});
 test('allows: quick deploy whose cached job targets a sandbox', () => {
   expectAllow('sf project deploy quick --job-id 0Af000000000002AAA -o sbx');
 });
@@ -351,7 +369,20 @@ test('no Node.js: blocks hidden command names, allows argument expansions', (t) 
   expectBlock('"$CLI" project deploy start -o prod', p);
   expectBlock(`$'\\x73\\x66' project deploy start -o prod`, p);
   expectBlock('X=1 $CLI project deploy start -o prod', p);
+  // Codex bug hunt, round 6 (B10): an expansion, brace, or glob anywhere in the command name.
+  expectBlock('PATH=/opt/node/bin:$PATH s${X:-f} project deploy start -o prod', p);
+  expectBlock('s{f..f} project deploy start -o prod', p);
+  expectBlock('s? project deploy start -o prod', p);
+  expectBlock('/usr/local/bin/s[f] project deploy start -o prod', p);
+  expectBlock('cd /tmp && exec s`printf f` project deploy start -o prod', p);
+  expectBlock('sudo s${X:-f} project deploy start -o prod', p);
+  expectBlock('sudo -u root s${X:-f} project deploy start -o prod', p);
+  expectBlock('timeout 5 s? project deploy start -o prod', p);
+  expectBlock('env -u PATH -i s{f..f} project deploy start -o prod', p);
   expectAllow('echo "$HOME"; ls $TMPDIR', p);
+  expectAllow('[ -f x ] && ls *.txt; [[ -n "$HOME" ]] && echo {a,b}', p);
+  // A wrapper skips only its options and option values, not the command name.
+  expectAllow('env echo "$HOME"; command ls *.txt; sudo -u root ls $TMPDIR; nice -n 5 cat a{1,2}.txt', p);
 });
 test('no Node.js: blocks Salesforce commands, allows other commands', (t) => {
   if (['/opt/homebrew/bin/node', '/usr/local/bin/node', '/usr/bin/node', '/bin/node'].some(existsSync)) { t.skip('a system node exists at a fallback path'); return; }
@@ -419,6 +450,12 @@ const noQuery = {
   'single-quoted substitution in an array is data': `examples=('$(${D} -o prod)'); printf '%s\\n' "\${examples[@]}"`,
   'sed substitution that mentions sf': `sed -i '' 's/sf project deploy start/sf project deploy validate/' README.md`,
   'awk filter that mentions sf': `awk '/sf project deploy/ {print $1}' notes.txt`,
+  'trap with a harmless action': `trap 'rm -f /tmp/x' EXIT`,
+  'trap reset and print': 'trap - INT; trap -p; trap -l',
+  'brace sequence that does not make sf': 'touch file{1..3}.txt s{a..c}',
+  'POSIX class glob that does not match sf': 'ls [[:digit:]]*.log',
+  'here-string script with an output redirection': `bash <<< 'echo hi' 2>/dev/null`,
+  'here-string replaces an earlier stdin file': `bash < /dev/null <<< 'sf org list'`,
   'git -c with a commit message that mentions sf': `git -c user.name=ci commit -m "${D} -o prod"`,
   'dev-debug on a read-only command': 'sf --dev-debug --debug-filter sf:* org list',
   'quick deploy alone': 'sf project deploy report --job-id 0Af000000000002AAA',
