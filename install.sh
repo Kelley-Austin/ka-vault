@@ -85,6 +85,14 @@ fi
 PLUGIN_ROOT="$(jq -r '.installPath' <<<"$INFO")"
 echo "✓ ${PLUGIN} is installed and enabled (${PLUGIN_ROOT})"
 
+# Turn on automatic updates for the marketplace, so guard fixes arrive when
+# Claude Code starts. "claude plugin marketplace add" does not set this.
+TMP_SETTINGS="$(mktemp "${GLOBAL_SETTINGS}.XXXXXX")"
+jq --arg m "$MARKETPLACE_NAME" 'if .extraKnownMarketplaces[$m] then .extraKnownMarketplaces[$m].autoUpdate = true else . end' "$GLOBAL_SETTINGS" > "$TMP_SETTINGS"
+jq -e . "$TMP_SETTINGS" >/dev/null
+mv "$TMP_SETTINGS" "$GLOBAL_SETTINGS"
+echo "✓ Automatic updates are on for the ${MARKETPLACE_NAME} marketplace"
+
 # ── 3. Self-test the installed plugin ────────────────────────────────────────
 # Run the hook command from hooks/hooks.json. A deploy with no target must give
 # exactly exit 2 (block). A harmless command must give exactly exit 0.
