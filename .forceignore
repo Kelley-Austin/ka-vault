@@ -1,5 +1,0 @@
-# .forceignore v2
-.forceignore
-**/jsconfig.json
-**/.eslintrc.json
-**/lwc/**/__tests__/**
